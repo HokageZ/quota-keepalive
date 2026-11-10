@@ -13,6 +13,10 @@ A pane named **Quota** beside the chat, refreshed once a minute, with the readin
 - the main session's cache age and its next ping, when a pause runs;
 - each subagent: model, status, tokens so far, cache age, and which weekly window it spends (a subagent on the main model spends the model window; any other model spends the all-models window only).
 
+## Controls in the pane
+
+Everything works from the pane itself, so the desktop app needs no typed command: **Refresh**, **Continue now** (while paused), **End simulation** (in test mode), a **Pause until** field (type `15:45`, Enter) and a **Main model weekly %** field (the number from the usage card, or `off`). `/quota` still works where slash commands do, and opens the pane.
+
 ## Thresholds
 
 - any window at 90%: heads-up toast;
@@ -24,7 +28,11 @@ Each threshold is said once per window reset.
 
 ## Keep-alive
 
-While paused (for quota, or until a clock time), the mod pings the main session with a short prompt every 45 minutes (configurable, kept under 55) and each paused subagent with a message. A ping does nothing but keep the cache warm. When the window resets, or the time arrives, the main session is told to continue and paused subagents are told to resume.
+While paused (for quota, or until a clock time), the mod pings the main session with a short prompt and each paused subagent with a message once its cache is 45 minutes old (configurable, kept under 55). Each cache keeps its own clock, counted from its last write, so a cache already old when the pause began is pinged in time. A ping that does not refresh the cache is tried again 5 minutes later. A ping does nothing but keep the cache warm.
+
+A quota pause whose reset is more than 12 hours off (a weekly window) is not kept warm: the pings would spend the quota that ran out and cost more than rebuilding the cache once. The pane says so.
+
+When the window resets, or the time arrives, the main session is told to continue and paused subagents are told to resume. A quota pause also ends when a fresh reading shows the window back under the level that paused it, so a pause begun before the reset time was known still ends.
 
 A ping is a real request, so it spends a little quota, and a ping to the main session appears as a visible row in the transcript.
 
@@ -51,6 +59,7 @@ Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `heads
 ## Files
 
 - `hooks/logic.ts`: pure rules (thresholds, pace, pause timing); `hooks/logic.test.ts` runs with `node --test hooks/logic.test.ts`
+- `hooks/register.test.tsx`: the pane on terminal and desktop, and the keep-alive timing; runs with `claude plugin test .`
 - `hooks/register.tsx`: the engine hooks, pane and commands
 - `types/index.d.ts`: the state contract
 

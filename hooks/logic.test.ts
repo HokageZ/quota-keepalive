@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_THRESHOLDS, HOUR, MINUTE, alertsFor, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
+import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
 import type { Limits } from './logic.ts'
 
 const base = (over: Partial<Limits>): Limits => ({
@@ -91,4 +91,33 @@ test('clock parsing and durations', () => {
   assert.equal(nextClock('09:05', now), new Date(2026, 10, 11, 9, 5, 0, 0).getTime())
   assert.equal(nextClock('25:00', now), null)
   assert.equal(fmtDur(4 * HOUR + 59 * MINUTE), '4h 59m')
+})
+
+test('keep-alive pings follow the cache age, not the pause start', () => {
+  const every = 45 * MINUTE
+  // The cache was written 40 minutes before the pause began: the ping is due 5 minutes in, not 45.
+  const written = cacheWrittenAt(0 * MINUTE, 40 * MINUTE)
+  assert.equal(written, 40 * MINUTE)
+  const cachedAt = cacheWrittenAt(1, 40 * MINUTE)
+  assert.equal(cachedAt, 1)
+  assert.equal(cachePingDue(0, 0, 44 * MINUTE, every), false)
+  assert.equal(cachePingDue(0, 0, 45 * MINUTE, every), true)
+  // A ping went out 2 minutes ago and the cache has not moved yet: wait, then retry.
+  assert.equal(cachePingDue(0, 50 * MINUTE, 52 * MINUTE, every), false)
+  assert.equal(cachePingDue(0, 50 * MINUTE, 50 * MINUTE + PING_RETRY, every), true)
+  // The ping landed: the cache is fresh again, so the next is a full interval out.
+  assert.equal(cachePingDue(50 * MINUTE, 50 * MINUTE, 90 * MINUTE, every), false)
+})
+
+test('keep-alive is worth it only for pauses that end soon', () => {
+  assert.equal(keepAliveWorth(3 * HOUR, 0), true)
+  assert.equal(keepAliveWorth(5 * 24 * HOUR, 0), false)
+  assert.equal(keepAliveWorth(null, 0), false)
+})
+
+test('a quota pause ends on the reset time or a reading back under the level', () => {
+  assert.equal(quotaBack(10, 10, 99, 98), true)
+  assert.equal(quotaBack(null, 10, 99, 98), false)
+  assert.equal(quotaBack(null, 10, 3, 98), true)
+  assert.equal(quotaBack(100, 10, null, 98), false)
 })
