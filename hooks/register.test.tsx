@@ -124,7 +124,7 @@ test('settings live in the panel and are saved for the next session', async ($, 
     await ui.press({ key: 'settings' })
     await clock.settle()
     expect(await ui.find({ key: 't-mainStop-95' })).toBeTruthy()
-    expect(await ui.find({ key: 'ping-30' })).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /^automatic$/ }))?.text).toBeTruthy()
     expect(await ui.find({ key: 'sim-main' })).toBeTruthy()
     await ui.press({ key: 'settings' })
     await clock.settle()
@@ -138,9 +138,6 @@ test('settings live in the panel and are saved for the next session', async ($, 
   await clock.settle()
   expect((await ui.find({ type: 'Text', text: /Main stop set to 95%/ }))?.text).toBeTruthy()
   expect((await ui.find({ type: 'Text', text: /main stops 95%/ }))?.text).toBeTruthy()
-  await ui.press({ key: 'ping-30' })
-  await clock.settle()
-  expect((await ui.find({ type: 'Text', text: /every 30 minutes/ }))?.text).toBeTruthy()
   // Test mode from a scenario chip: the main stop fires and pauses the session.
   await ui.press({ key: 'sim-main' })
   await clock.settle()
@@ -150,7 +147,6 @@ test('settings live in the panel and are saved for the next session', async ($, 
   await clock.settle()
   expect((await ui.find({ type: 'Text', text: /^42%$/ }))?.text).toBeTruthy()
   expect(JSON.stringify(saved.at(-1))).toContain('"mainStop":95')
-  expect(JSON.stringify(saved.at(-1))).toContain('"pingMinutes":30')
   await ui.unmount()
 })
 
@@ -166,5 +162,31 @@ test('the panel follows new readings by itself within 15 seconds, no Refresh pre
   readings.five = 35
   await clock.advance(15_000)
   expect((await ui.find({ type: 'Text', text: /^35%$/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('at 100% of a limit the keep-alive stands down: no pings, and the panel says why', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  const pings = engine(on, { five: 100, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.advance(2 * HOUR)
+  expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /limit is at 100%/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('a 3-hour pause plans 3 pings, 45 minutes apart', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'pause-180' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Text', text: /^45m$/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^pings before reset$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })

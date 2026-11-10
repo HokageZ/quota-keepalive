@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
+import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, limitSpent, pingPlan, planDue, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
 import type { Limits } from './logic.ts'
 
 const base = (over: Partial<Limits>): Limits => ({
@@ -129,4 +129,33 @@ test('a reset time that drifts by seconds does not say a threshold again', () =>
   assert.equal(first.length, 1)
   assert.equal(alertsFor(at(10 * HOUR + 7_000), t, first.map(a => a.id)).length, 0)
   assert.equal(alertsFor(at(15 * HOUR), t, first.map(a => a.id)).length, 1)
+})
+
+test('pings are planned from the time to reset: equal gaps of at most 50 minutes', () => {
+  // 3 hours to reset: 3 pings, 45 minutes apart; the cache is 45 minutes old at the reset.
+  const plan = pingPlan(0, 3 * HOUR)
+  assert.deepEqual(plan, { next: 45 * MINUTE, gap: 45 * MINUTE, left: 3 })
+  // After the first ping lands, the rest of the span keeps the same rhythm.
+  assert.equal(pingPlan(45 * MINUTE, 3 * HOUR)?.gap, 45 * MINUTE)
+  // 40 minutes to reset: the cache outlives the wait, no ping.
+  assert.equal(pingPlan(0, 40 * MINUTE), null)
+  // 70 minutes to reset: one ping at 35 minutes.
+  assert.deepEqual(pingPlan(0, 70 * MINUTE), { next: 35 * MINUTE, gap: 35 * MINUTE, left: 1 })
+  // No reset time known: one 50-minute gap at a time.
+  assert.equal(pingPlan(0, null)?.next, 50 * MINUTE)
+})
+
+test('a planned ping is due once its time comes, and retried after PING_RETRY', () => {
+  const plan = pingPlan(0, 3 * HOUR)
+  assert.equal(planDue(plan, 0, 44 * MINUTE), false)
+  assert.equal(planDue(plan, 0, 45 * MINUTE), true)
+  assert.equal(planDue(plan, 45 * MINUTE, 47 * MINUTE), false)
+  assert.equal(planDue(plan, 45 * MINUTE, 45 * MINUTE + PING_RETRY), true)
+  assert.equal(planDue(null, 0, 10 * HOUR), false)
+})
+
+test('a limit at 100% stands the keep-alive down', () => {
+  assert.equal(limitSpent([99, 40]), false)
+  assert.equal(limitSpent([100, 40]), true)
+  assert.equal(limitSpent([null, 100.2]), true)
 })

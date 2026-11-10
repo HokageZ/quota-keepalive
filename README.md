@@ -23,7 +23,7 @@ The panel is the main view: every setting is a click, and nothing needs typing. 
 
 - **Pause for** 30m, 1h, 2h, 3h, or **Until 5-hour reset**; **Continue now** while paused.
 - The main model's weekly percent is picked from a list (the number on the usage card).
-- **Settings** in the footer: a scale with the 5-hour and weekly levels, then chips for the heads-up, subagents stop, main stop and weekly stop percents and the keep-alive ping interval, test-mode scenarios (Heads-up, Subagents stop, Main stop, Weekly stop, End test), and **Reset to defaults**. Saved for every session.
+- **Settings** in the footer: a scale with the 5-hour and weekly levels, then chips for the heads-up, subagents stop, main stop and weekly stop percents, test-mode scenarios (Heads-up, Subagents stop, Main stop, Weekly stop, End test), and **Reset to defaults**. Saved for every session.
 
 The typed forms still work where slash commands run, for values the chips do not offer: `/quota show`, `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 43` or `off`.
 
@@ -38,13 +38,15 @@ Each threshold is said once per window reset.
 
 ## Keep-alive
 
-While paused (for quota, or until a clock time), the mod pings the main session with a short prompt and each paused subagent with a message once its cache is 45 minutes old (configurable, kept under 55). Each cache keeps its own clock, counted from its last write, so a cache already old when the pause began is pinged in time. A ping that does not refresh the cache is tried again 5 minutes later. A ping does nothing but keep the cache warm.
+Automatic; there is nothing to set. When a pause starts (a stop level, or **Pause for** in the panel), the mod plans the pings from the time to the reset: the span from each cache's last write to the reset is split into the fewest equal gaps of at most 50 minutes (the 60-minute cache less a 10-minute margin). Three hours to the reset gives 3 pings, 45 minutes apart, and the cache is 45 minutes old when work resumes. A wait shorter than 50 minutes needs no ping. With no reset time known, it pings every 50 minutes.
 
-A quota pause whose reset is more than 12 hours off (a weekly window) is not kept warm: the pings would spend the quota that ran out and cost more than rebuilding the cache once. The pane says so.
+The main session gets a short prompt and each paused subagent a message; each cache keeps its own plan. A ping that does not refresh the cache is tried again 5 minutes later. A ping does nothing but keep the cache warm.
 
-When the window resets, or the time arrives, the main session is told to continue and paused subagents are told to resume. A quota pause also ends when a fresh reading shows the window back under the level that paused it, so a pause begun before the reset time was known still ends.
+The keep-alive stands down, and the panel says why:
+- at 100% of a limit, where every request, a ping included, is refused;
+- for a quota pause more than 12 hours from its reset (a weekly window): the pings would spend the quota that ran out and cost more than rebuilding the cache once.
 
-A ping is a real request, so it spends a little quota, and a ping to the main session appears as a visible row in the transcript.
+When the window resets, or the time arrives, the main session is told to continue and paused subagents are told to resume. A quota pause also ends when a fresh reading shows the window back under the level that paused it.
 
 ## Commands (optional)
 
@@ -57,7 +59,7 @@ A ping is a real request, so it spends a little quota, and a ping to the main se
 
 ## Settings
 
-Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `headsUpPercent` (90), `subagentsStopPercent` (96), `mainStopPercent` (98), `weekStopPercent` (99), `pingMinutes` (45).
+Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `headsUpPercent` (90), `subagentsStopPercent` (96), `mainStopPercent` (98), `weekStopPercent` (99).
 
 ## Limits of what a mod can do
 

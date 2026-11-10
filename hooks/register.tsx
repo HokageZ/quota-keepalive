@@ -7,7 +7,9 @@ import {
   HOUR,
   MINUTE,
   alertsFor,
-  cachePingDue,
+  limitSpent,
+  pingPlan,
+  planDue,
   cacheWrittenAt,
   fmtDur,
   keepAliveWorth,
@@ -53,11 +55,6 @@ const baseThresholds = (o: Options): Thresholds => ({
   weekStop: num(o.weekStopPercent, DEFAULT_THRESHOLDS.weekStop),
 })
 
-const pingMs = (o: Options, ov: Overrides): number => {
-  const m = ov.pingMinutes ?? num(o.pingMinutes, 45)
-  // Under the one-hour cache lifetime, with a margin.
-  return Math.min(55, Math.max(1, m)) * MINUTE
-}
 
 // The panel's pass, as often as the cache-countdown band's: reading the plan limits is local and free.
 const TICK_MS = 15_000
@@ -205,18 +202,25 @@ async function resume($: EngineInterface, why: string): Promise<string> {
 
 // Pings the main session and each paused subagent while a pause runs: each cache on its own
 // clock, from when it was last written, so a cache already old when the pause began is not lost.
-async function keepAlive($: EngineInterface, opts: Options): Promise<void> {
+// The window a pause waits on, as last read: its percent, for the stand-down at 100%.
+function spentNow(q: QuotaState): boolean {
+  const l = q.limits
+  return l ? limitSpent(windowsOf(l).map(w => w.win.percent)) : false
+}
+
+// Pings the main session and each paused subagent while a pause runs, on a plan made from the
+// time to reset: equal gaps of at most 50 minutes from each cache's last write, so every cache is
+// still warm when the pause ends. Nothing to set. The keep-alive stands down when a pause is
+// days long (a weekly window) or a limit is at 100%, where every request is refused.
+async function keepAlive($: EngineInterface): Promise<void> {
   const p = await read($, pause)
   if (p.kind === 'none') return
   const now = await $.clock.now()
-  // A quota pause days long (a weekly window) is not kept warm: the pings would spend
-  // the quota that ran out, and cost more than rebuilding the cache once.
   if (p.kind === 'quota' && !keepAliveWorth(p.until, now)) return
-  const ov = await read($, overrides)
-  const every = pingMs(opts, ov)
+  if (spentNow(await read($, quota))) return
   const m = await read($, main)
 
-  if (cachePingDue(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.lastPingAt, now, every)) {
+  if (planDue(pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until), p.lastPingAt, now)) {
     await update($, pause, prev => ({ ...prev, lastPingAt: now }))
     $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: keep-alive ping to the main session failed: ${(err as Error).message}`))
   }
@@ -224,7 +228,7 @@ async function keepAlive($: EngineInterface, opts: Options): Promise<void> {
   const map = await read($, agents)
   for (const [id, a] of Object.entries(map)) {
     if (a.status !== 'paused') continue
-    if (!cachePingDue(cacheWrittenAt(a.lastCacheAt, p.startedAt), a.lastPingAt ?? 0, now, every)) continue
+    if (!planDue(pingPlan(cacheWrittenAt(a.lastCacheAt, p.startedAt), p.until), a.lastPingAt ?? 0, now)) continue
     await update($, agents, all => (all[id] ? { ...all, [id]: { ...all[id], lastPingAt: now } } : all))
     try {
       await $.session.send({ to: { agentId: id }, text: PING_AGENT })
@@ -269,7 +273,7 @@ async function tick($: EngineInterface, opts: Options): Promise<void> {
       await resume($, 'The time you gave has come.')
       return
     }
-    await keepAlive($, opts)
+    await keepAlive($)
   } finally {
     ticking = false
   }
@@ -322,7 +326,10 @@ async function rows($: EngineInterface, opts: Options): Promise<string[]> {
         ? 'no pings (not paused)'
         : p.kind === 'quota' && !keepAliveWorth(p.until, now)
           ? 'no pings: the pause ends too far off to keep the cache warm'
-          : `next ping in ${fmtDur(Math.max(0, m.lastCacheAt + pingMs(opts, ov) - now))}`
+          : (() => {
+              const plan = pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until)
+              return plan ? `next ping in ${fmtDur(Math.max(0, plan.next - now))}` : 'no ping needed before the reset'
+            })()
     out.push(`Main cache: ${fmtDur(age)} old; ${due}`)
   }
   out.push('Overage: a mod cannot see it. If the session enters extra usage, the cache drops to 5 minutes.')
@@ -390,11 +397,11 @@ async function simulateOff($: EngineInterface): Promise<string> {
 
 // Settings the person changes in the panel; kept in $.store so they outlast the session.
 const STORE_KEY = 'settings'
-type Saved = { thresholds: Partial<Thresholds>; pingMinutes: number | null }
+type Saved = { thresholds: Partial<Thresholds> }
 
 async function saveSettings($: EngineInterface): Promise<void> {
   const ov = await read($, overrides)
-  const saved: Saved = { thresholds: ov.thresholds, pingMinutes: ov.pingMinutes }
+  const saved: Saved = { thresholds: ov.thresholds }
   try {
     await $.store.set(STORE_KEY, saved)
   } catch (err) {
@@ -417,8 +424,7 @@ async function loadSettings($: EngineInterface): Promise<void> {
     const v = raw.thresholds?.[k]
     if (typeof v === 'number' && v >= 1 && v <= 100) thresholds[k] = v
   }
-  const ping = typeof raw.pingMinutes === 'number' && raw.pingMinutes >= 1 && raw.pingMinutes <= 55 ? raw.pingMinutes : null
-  await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: ping }))
+  await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: null }))
 }
 
 const THRESHOLD_NAMES: Record<keyof Thresholds, string> = {
@@ -437,14 +443,6 @@ async function setThreshold($: EngineInterface, key: keyof Thresholds, raw: stri
   return `${THRESHOLD_NAMES[key]} set to ${pct}%.`
 }
 
-async function setPingMinutes($: EngineInterface, raw: string): Promise<string> {
-  const m = Number(raw.trim())
-  if (raw.trim() === '' || !Number.isFinite(m) || m < 1 || m > 55) return 'Use minutes from 1 to 55 (the cache lasts 60).'
-  await update($, overrides, prev => ({ ...prev, pingMinutes: m }))
-  await saveSettings($)
-  return `Keep-alive pings every ${m} minutes.`
-}
-
 // The chips offered for each setting; the current value is added when it is none of them.
 const CHOICES: Record<keyof Thresholds, number[]> = {
   headsUp: [75, 80, 85, 90, 95],
@@ -452,7 +450,6 @@ const CHOICES: Record<keyof Thresholds, number[]> = {
   mainStop: [95, 96, 97, 98, 99],
   weekStop: [95, 97, 98, 99, 100],
 }
-const PING_CHOICES = [15, 30, 40, 45, 50, 55]
 const withCurrent = (list: number[], current: number): number[] => (list.includes(current) ? list : [...list, current].sort((a, b) => a - b))
 
 // Test scenarios: made-up readings that each cross one level.
@@ -606,7 +603,6 @@ export const register: Register = (on, options) => {
     const map = await read($, agents)
     const note = await read($, said)
     const t = thresholdsOf(opts, ov)
-    const every = pingMs(opts, ov)
 
     const act = (work: () => Promise<string>) => {
       void work().then(
@@ -791,7 +787,8 @@ export const register: Register = (on, options) => {
     const share = cacheLeft === null ? 0 : Math.max(0, cacheLeft / ttl)
     const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
     const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
-    const nextPing = p.kind === 'none' ? null : farOff ? null : Math.max(0, cacheWrittenAt(m.lastCacheAt, p.startedAt) + every - now)
+    const spent = spentNow(q)
+    const plan = p.kind === 'none' || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until)
     const pauseText =
       p.kind === 'none'
         ? 'Not paused'
@@ -830,11 +827,21 @@ export const register: Register = (on, options) => {
             <Text bold color={p.kind === 'none' ? undefined : 'warning'}>
               {pauseText}
             </Text>
-            {p.kind === 'none'
-              ? stat('off', 'keep-alive')
-              : farOff
-                ? <Text dimColor>no pings: the reset is too far off</Text>
-                : stat(nextPing === null ? '?' : fmtDur(nextPing), 'to next ping', 'warning')}
+            {p.kind === 'none' ? (
+              stat('standing by', 'keep-alive')
+            ) : spent ? (
+              <Text dimColor>no pings: the limit is at 100%, requests are refused</Text>
+            ) : farOff ? (
+              <Text dimColor>no pings: the reset is too far off</Text>
+            ) : plan === null ? (
+              <Text dimColor>no ping needed: the cache outlasts the wait</Text>
+            ) : (
+              <>
+                {stat(fmtDur(Math.max(0, plan.next - now)), 'to next ping', 'warning')}
+                {plan.left !== null ? stat(String(plan.left), plan.left === 1 ? 'ping before reset' : 'pings before reset') : null}
+                {stat(`${Math.round(plan.gap / MINUTE)}m`, 'apart')}
+              </>
+            )}
           </Box>
           {p.kind !== 'none' ? (
             <Box marginTop={isRich ? 1 : 0}>
@@ -897,7 +904,6 @@ export const register: Register = (on, options) => {
           {chips(`t-${key}`, withCurrent(CHOICES[key], t[key]), t[key], v => `${v}%`, v => setThreshold($, key, String(v)))}
         </Box>
       )
-      const pingNow = Math.round(every / MINUTE)
       parts.push(
         card(
           'settings',
@@ -921,11 +927,12 @@ export const register: Register = (on, options) => {
             {row('weekStop', 'everything stops, weekly')}
             <Box flexDirection="column" marginTop={1}>
               <Box gap={1} alignItems="center">
-                <Text bold>Keep-alive ping</Text>
-                <Text bold color="success">every {pingNow}m</Text>
-                <Text dimColor>while paused; the cache lasts 60m</Text>
+                <Text bold>Keep-alive</Text>
+                <Text bold color="success">automatic</Text>
               </Box>
-              {chips('ping', withCurrent(PING_CHOICES, pingNow), pingNow, v => `${v}m`, v => setPingMinutes($, String(v)))}
+              <Text dimColor>
+                While paused, pings are spread evenly up to the reset, at most 50 minutes apart, so the 60-minute cache is warm when work resumes. They stop at 100% of a limit, and for waits over 12 hours.
+              </Text>
             </Box>
             <Box flexDirection="column" marginTop={1}>
               <Box gap={1} alignItems="center">
