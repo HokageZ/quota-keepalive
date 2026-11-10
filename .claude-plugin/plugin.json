@@ -1,6 +1,6 @@
 {
   "name": "quota-keepalive",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Watches the plan's 5-hour and weekly limits beside the chat, warns at set thresholds, and keeps the main session's and paused subagents' prompt caches warm until the reset.",
   "types": "./types/index.d.ts",
   "userConfig": {
