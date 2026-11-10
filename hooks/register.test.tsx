@@ -57,6 +57,7 @@ test('the pane draws its controls on every surface, and a pause starts from the 
     expect(await ui.find({ key: 'refresh' })).toBeTruthy()
     expect(await ui.find({ key: 'pause-60' })).toBeTruthy()
     expect(await ui.find({ key: 'pause-reset' })).toBeTruthy()
+    expect(await ui.find({ key: 'warm-on' })).toBeTruthy()
     expect(await ui.find({ key: 'model-week' })).toBeTruthy()
     await ui.unmount()
   }
@@ -221,8 +222,8 @@ test('stay warm, turned on in the panel: an idle session gets a ping each interv
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'settings' })
-  await clock.settle()
+  // Stay warm is on the page: no Settings needed.
+  expect(await ui.find({ key: 't-mainStop-95' })).toBeFalsy()
   await ui.press({ key: 'warm-on' })
   await clock.settle()
   await ui.press({ key: 'warm-every-30' })
@@ -256,8 +257,8 @@ test('stay warm rests at the heads-up level', async ($, on) => {
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'settings' })
-  await clock.settle()
+  // Stay warm is on the page: no Settings needed.
+  expect(await ui.find({ key: 't-mainStop-95' })).toBeFalsy()
   await ui.press({ key: 'warm-on' })
   await clock.settle()
   await $.prompt.submit({ text: 'hello', wait: false } as never)
