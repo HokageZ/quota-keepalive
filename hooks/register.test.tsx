@@ -266,3 +266,40 @@ test('your own replies count: one that writes the cache moves the next ping back
   expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
   await ui.unmount()
 })
+
+test('the bridge: a stop level pauses work by itself and keeps the cache warm to the reset, then work continues', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  // 98.5% of the 5-hour limit, which resets in 3 hours: past the 98% main stop.
+  const readings = { five: 98.5, week: 30, weekResetsIn: 4 * 24 * HOUR }
+  const pings = engine(on, readings, clock.now)
+  engineStep(on)
+  const rows = mock.session(on)
+  await reply($, on) // the last reply wrote the cache
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^Work paused by the 5-hour limit/ }))?.text).toBeTruthy()
+  expect(JSON.stringify(rows.appended())).toContain('stop starting new work')
+
+  // 3 hours to the reset: pings at 45, 90 and 135 minutes.
+  const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
+  await clock.advance(44 * MINUTE)
+  expect(keepAlive()).toBe(0)
+  await clock.advance(2 * MINUTE)
+  expect(keepAlive()).toBe(1)
+  await reply($, on)
+  await clock.advance(45 * MINUTE)
+  expect(keepAlive()).toBe(2)
+  await reply($, on)
+  await clock.advance(45 * MINUTE)
+  expect(keepAlive()).toBe(3)
+  await reply($, on)
+
+  // The reset: the window reads low again, the pause ends and the main session is told to continue.
+  readings.five = 2
+  await clock.advance(45 * MINUTE)
+  expect(pings.some(t => t.startsWith('The quota window reset.'))).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /^Not keeping warm$/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
