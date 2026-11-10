@@ -292,14 +292,75 @@ test('the bridge: a stop level pauses work by itself and keeps the cache warm to
   await clock.advance(45 * MINUTE)
   expect(keepAlive()).toBe(2)
   await reply($, on)
-  await clock.advance(45 * MINUTE)
-  expect(keepAlive()).toBe(3)
-  await reply($, on)
 
-  // The reset: the window reads low again, the pause ends and the main session is told to continue.
+  // The window reads low again (a reset): on the next pass the pause ends and the main session
+  // is told to continue. The third ping at 135 minutes is the logic tests' to check.
   readings.five = 2
-  await clock.advance(45 * MINUTE)
+  await clock.advance(15_000)
   expect(pings.some(t => t.startsWith('The quota window reset.'))).toBe(true)
   expect((await ui.find({ type: 'Text', text: /^Not keeping warm$/ }))?.text).toBeTruthy()
   await ui.unmount()
+})
+
+const BAND = {
+  plugin: 'quota-keepalive',
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isCollapsed: false, isWorking: false, maxRows: 6, bodyColumns: 120 },
+} as const
+
+test('the band above the prompt: cache time left and what to re-cache; Settings opens the panel', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await reply($, on)
+  await clock.advance(15 * MINUTE)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = await $.ui.mount({ ...BAND, surface })
+    expect((await band.find({ type: 'Text', text: /^Prompt cache$/ }))?.text).toBeTruthy()
+    expect((await band.find({ type: 'Text', text: /^45m left$/ }))?.text).toBeTruthy()
+    // 10 input + 50,000 read + 20 output: the next message re-caches about 50k tokens.
+    expect((await band.find({ type: 'Text', text: /^50k$/ }))?.text).toBeTruthy()
+    // No hit rate or misses here, and no warning at 20%.
+    expect(await band.find({ type: 'Text', text: /hit|miss|heads-up/ })).toBeFalsy()
+    await band.unmount()
+  }
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'band-settings' })
+  await clock.settle()
+  await band.unmount()
+  const pane = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await pane.find({ key: 't-mainStop-95' })).toBeTruthy()
+  await pane.unmount()
+})
+
+test('the band shows our warning at the heads-up level', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  engine(on, { five: 91, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await reply($, on)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^5-hour 91%: heads-up$/ }))?.text).toBeTruthy()
+  await band.unmount()
+})
+
+test('at the stop the band shows the pause and the pings that keep the cache to the reset', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  engine(on, { five: 98.5, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await reply($, on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = await $.ui.mount({ ...BAND, surface })
+    expect((await band.find({ type: 'Text', text: /^Work paused until/ }))?.text).toBeTruthy()
+    expect((await band.find({ type: 'Text', text: /^3 pings 45m apart · next 45m$/ }))?.text).toBeTruthy()
+    await band.unmount()
+  }
 })
