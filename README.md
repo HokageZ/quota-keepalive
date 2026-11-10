@@ -17,6 +17,16 @@ A pane named **Quota** beside the chat. It reads the plan limits every 15 second
 
 The pane follows the cache-countdown mod: rounded cards, a ring and a bar in green, amber and red (amber from the heads-up level, red from the stop level), bold values with dim labels. Each limit's bar marks its thresholds. The terminal draws the same cards with block characters.
 
+## Band above the prompt
+
+A one-line band above the prompt box, in the cache-countdown style:
+- the prompt cache: a ring, time left of its 60 minutes (or Expired), and how many tokens the next message would re-cache;
+- the live warning from your thresholds (heads-up, subagents stop, stop), in amber or red;
+- while work is paused or kept warm: until when, and the ping plan (`3 pings 45m apart · next 12m`);
+- **Settings**, which opens the panel with its settings.
+
+It stacks with any other band, such as cache-countdown's; turn that mod off if one cache line is enough.
+
 ## Controls in the pane
 
 The panel is the main view: every control is a click, and nothing needs typing. `/quota` opens it.

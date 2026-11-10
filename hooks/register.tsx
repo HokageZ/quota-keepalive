@@ -569,7 +569,9 @@ export const register: Register = (on, options) => {
     const cached = (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0) > 0
     const tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0)
     if (!e.agentId) {
-      await update($, main, m => ({ ...m, model, lastTurnAt: now, lastCacheAt: cached ? now : m.lastCacheAt }))
+      const recache =
+        (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.output_tokens || 0)
+      await update($, main, m => ({ ...m, model, lastTurnAt: now, lastCacheAt: cached ? now : m.lastCacheAt, recache }))
     } else {
       const agentId = e.agentId
       await update($, agents, map => {
@@ -1048,4 +1050,144 @@ export const register: Register = (on, options) => {
 
     return <Box flexDirection="column">{parts}</Box>
   })
+
+  // A small band above the prompt, in the cache-countdown style: the cache's time left and what
+  // the next message would re-cache, the live warning from the thresholds, and while work is
+  // paused or kept warm, the ping plan. Settings opens the panel. What sits beneath is kept.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (e.props.hasSurvey) return next(e)
+    const below = await next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const isRich = e.surface !== 'terminal' && e.surface !== 'vscode'
+    const Svg = isRich ? $.ui.resolve(e).Svg : null
+    const isNarrow = e.props.bodyColumns < 88
+
+    const now = await $.clock.now()
+    const q = await read($, quota)
+    const m = await read($, main)
+    const p = await read($, pause)
+    const t = thresholdsOf(opts, await read($, overrides))
+    const l = q.limits
+    if (!l && !m.lastCacheAt) return below
+
+    // The cache: time left of its lifetime, and what a cold cache would cost.
+    const ttl = l && windowsOf(l).some(w => w.win.percent >= 100) ? 5 * MINUTE : HOUR
+    const left = m.lastCacheAt ? m.lastCacheAt + ttl - now : null
+    const share = left === null ? 0 : Math.max(0, left / ttl)
+    const tone: Tone = left === null ? 'success' : cacheTone(share)
+    const kTok = (n: number) => (n < 1000 ? `${n}` : `${Math.round(n / 1000)}k`)
+    const recache = m.recache ? kTok(m.recache) : null
+
+    // The live warning: the highest level any limit has reached.
+    let warning: { text: string; tone: Tone; rank: number } | null = null
+    for (const { key, win } of l ? windowsOf(l) : []) {
+      const name = key === 'fiveHour' ? '5-hour' : key === 'weekAll' ? 'weekly' : 'model weekly'
+      const stopAt = key === 'fiveHour' ? t.mainStop : t.weekStop
+      const at = pct(win.percent)
+      const w =
+        win.percent >= stopAt
+          ? { text: `${name} ${at}: stop`, tone: 'error' as Tone, rank: 3 }
+          : key === 'fiveHour' && win.percent >= t.subagentsStop
+            ? { text: `${name} ${at}: subagents stop`, tone: 'error' as Tone, rank: 2 }
+            : win.percent >= t.headsUp
+              ? { text: `${name} ${at}: heads-up`, tone: 'warning' as Tone, rank: 1 }
+              : null
+      if (w && (!warning || w.rank > warning.rank)) warning = w
+    }
+
+    // Paused or kept warm: the plan that keeps the cache alive to the end.
+    const tgt = await warmTarget($)
+    const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
+    const plan = tgt && !farOff && !spentNow(q) ? pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until) : null
+    const holdText = !tgt
+      ? null
+      : p.kind !== 'none'
+        ? `Work paused${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
+        : `Keeping warm${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
+    const planText = !tgt
+      ? null
+      : farOff
+        ? 'no pings: the reset is days off'
+        : spentNow(q)
+          ? 'no pings: limit at 100%'
+          : plan === null
+            ? 'no ping needed'
+            : `${plan.left === null ? 'a ping' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} ${Math.round(plan.gap / MINUTE)}m apart · next ${fmtDur(Math.max(0, plan.next - now))}`
+
+    const openPanel = async () => {
+      await update($, settingsOpen, () => true)
+      await $.ui.open({ id: PANE, title: 'Quota' })
+    }
+
+    const cachePart = (
+      <Box gap={1} alignItems="center" flexShrink={0}>
+        {Svg ? (
+          <Svg source={ringSvg(share, tone)} alt={left === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${fmtDur(Math.max(0, left))} left`} width={18} height={18} />
+        ) : (
+          <Text color={tone}>{left !== null && left > 0 ? '●' : '○'}</Text>
+        )}
+        <Text bold>Prompt cache</Text>
+        {left === null ? (
+          <Text dimColor>no reply yet</Text>
+        ) : left > 0 ? (
+          <>
+            <Text bold color={tone}>
+              {fmtDur(left)} left
+            </Text>
+            {isNarrow ? null : <Text dimColor>of {ttl === HOUR ? '60m' : '5m'}</Text>}
+          </>
+        ) : (
+          <Text bold color="error">
+            Expired
+          </Text>
+        )}
+        {recache && !isNarrow ? (
+          <>
+            <Text dimColor>· re-cache</Text>
+            <Text bold>{recache}</Text>
+          </>
+        ) : null}
+      </Box>
+    )
+
+    const ours = (
+      <Box
+        borderStyle="round"
+        borderDimColor={!warning && !tgt}
+        borderColor={warning ? warning.tone : tgt ? 'warning' : undefined}
+        paddingX={1}
+        alignItems="center"
+        justifyContent="space-between"
+        gap={2}
+        flexWrap="wrap"
+      >
+        {cachePart}
+        <Box gap={2} alignItems="center" flexShrink={1} flexWrap="wrap">
+          {holdText ? (
+            <Box gap={1} alignItems="center">
+              <Text bold color="warning">
+                {holdText}
+              </Text>
+              {planText && !isNarrow ? <Text dimColor>{planText}</Text> : null}
+            </Box>
+          ) : null}
+          {warning && !holdText ? (
+            <Text bold color={warning.tone}>
+              {warning.text}
+            </Text>
+          ) : null}
+          <Button key="band-settings" label="Settings" onPress={() => void openPanel()} />
+        </Box>
+      </Box>
+    )
+
+    return (
+      <Box flexDirection="column">
+        {ours}
+        {below}
+      </Box>
+    )
+  })
+
 }

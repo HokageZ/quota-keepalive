@@ -58,6 +58,8 @@ export type MainState = {
   model: string
   lastTurnAt: number
   lastCacheAt: number
+  // Tokens the next message would re-cache: the last reply's prompt plus its output.
+  recache?: number
 }
 
 // What Stay warm watches: the person's last prompt, its own last ping, and a running main turn.
