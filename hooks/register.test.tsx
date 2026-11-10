@@ -367,8 +367,11 @@ test('at the stop the band shows the pause and the pings that keep the cache to 
   await clock.settle()
   for (const surface of ['terminal', 'desktop'] as const) {
     const band = await $.ui.mount({ ...BAND, surface })
-    expect((await band.find({ type: 'Text', text: /^Work paused until/ }))?.text).toBeTruthy()
-    expect((await band.find({ type: 'Text', text: /^3 pings 45m apart · next 45m$/ }))?.text).toBeTruthy()
+    expect((await band.find({ type: 'Text', text: /^Paused until/ }))?.text).toBeTruthy()
+    expect((await band.find({ type: 'Text', text: /^3 pings · next 45m$/ }))?.text).toBeTruthy()
+    // While paused the row keeps to what matters: no re-cache stat, no "of 60 min".
+    expect(await band.find({ type: 'Text', text: /re-cache|of 60 min/ })).toBeFalsy()
+    expect(await band.find({ key: 'band-settings' })).toBeTruthy()
     await band.unmount()
   }
 })
