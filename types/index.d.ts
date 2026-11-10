@@ -67,7 +67,14 @@ export type WarmFacts = {
   busy: boolean
 }
 
-export type StayWarmCfg = { on: boolean; everyMin: number; forHours: number }
+// What the person asked for: keep the cache warm until a time, or the 5-hour reset ('reset',
+// read live), or not at all ('off').
+export type KeepState = {
+  choice: 'off' | '1' | '2' | '4' | 'reset'
+  until: number | null
+  startedAt: number
+  lastPingAt: number
+}
 
 export type AgentState = {
   model: string
@@ -88,7 +95,7 @@ declare module 'claude-code' {
       agents: Shaped<Record<string, AgentState>>
       said: Shaped<string>
       settingsOpen: Shaped<boolean>
-      warmCfg: Shaped<StayWarmCfg>
+      keep: Shaped<KeepState>
       warm: Shaped<WarmFacts>
     }
   }

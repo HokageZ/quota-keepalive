@@ -1,15 +1,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentState, MainState, Overrides, PauseState, QuotaLimits, QuotaState, QuotaWindow, WarmFacts } from '../types'
+import type { AgentState, KeepState, MainState, Overrides, PauseState, QuotaLimits, QuotaState, QuotaWindow, WarmFacts } from '../types'
 import {
   DEFAULT_THRESHOLDS,
   HOUR,
   MINUTE,
   alertsFor,
-  STAY_WARM_DEFAULT,
-  STAY_WARM_EVERY,
-  STAY_WARM_FOR,
   limitSpent,
   pingPlan,
   planDue,
@@ -21,10 +18,9 @@ import {
   paceOf,
   quotaBack,
   spendsWindow,
-  stayWarmPlan,
   windowsOf,
 } from './logic'
-import type { Alert, Sample, StayWarm, Thresholds, WarmPlan } from './logic'
+import type { Alert, Sample, Thresholds } from './logic'
 import { barSvg, blocks, cacheTone, pct, ringSvg, scaleSvg, toneOf } from './view'
 import type { Tone } from './view'
 
@@ -45,7 +41,8 @@ const pause = atom({ plugin: 'quota-keepalive', key: 'pause' } as const, NO_PAUS
 const main = atom({ plugin: 'quota-keepalive', key: 'main' } as const, { model: '', lastTurnAt: 0, lastCacheAt: 0 } as MainState, { shape: SHAPE })
 const said = atom({ plugin: 'quota-keepalive', key: 'said' } as const, '' as string, { shape: SHAPE })
 const settingsOpen = atom({ plugin: 'quota-keepalive', key: 'settingsOpen' } as const, false as boolean, { shape: SHAPE })
-const warmCfg = atom({ plugin: 'quota-keepalive', key: 'warmCfg' } as const, STAY_WARM_DEFAULT as StayWarm, { shape: SHAPE })
+const NO_KEEP: KeepState = { choice: 'off', until: null, startedAt: 0, lastPingAt: 0 }
+const keep = atom({ plugin: 'quota-keepalive', key: 'keep' } as const, NO_KEEP, { shape: SHAPE })
 const warm = atom({ plugin: 'quota-keepalive', key: 'warm' } as const, { lastWorkAt: 0, lastPingAt: 0, busy: false } as WarmFacts, { shape: SHAPE })
 const agents = atom({ plugin: 'quota-keepalive', key: 'agents' } as const, {} as Record<string, AgentState>, { shape: SHAPE })
 
@@ -194,6 +191,7 @@ async function resume($: EngineInterface, why: string): Promise<string> {
   const p = await read($, pause)
   if (p.kind === 'none') return 'Nothing is paused.'
   await update($, pause, () => NO_PAUSE)
+  await update($, keep, () => NO_KEEP)
   const list = await $.agent.list()
   const map = await read($, agents)
   for (const a of list) {
@@ -214,69 +212,57 @@ function spentNow(q: QuotaState): boolean {
   return l ? limitSpent(windowsOf(l).map(w => w.win.percent)) : false
 }
 
-// Pings the main session and each paused subagent while a pause runs, on a plan made from the
-// time to reset: equal gaps of at most 50 minutes from each cache's last write, so every cache is
-// still warm when the pause ends. Nothing to set. The keep-alive stands down when a pause is
-// days long (a weekly window) or a limit is at 100%, where every request is refused.
-async function keepAlive($: EngineInterface): Promise<void> {
+// The one keep-warm target: a running pause's end, else the end the person picked
+// (a time, or the 5-hour reset as last read). Null when nothing asks for the cache to stay warm.
+type Target = { until: number | null; startedAt: number; lastPingAt: number; source: 'pause' | 'keep' }
+
+async function warmTarget($: EngineInterface): Promise<Target | null> {
   const p = await read($, pause)
-  if (p.kind === 'none') return
+  if (p.kind !== 'none') return { until: p.until, startedAt: p.startedAt, lastPingAt: p.lastPingAt, source: 'pause' }
+  const k = await read($, keep)
+  if (k.choice === 'off') return null
+  const q = await read($, quota)
+  const until = k.choice === 'reset' ? (q.limits?.fiveHour?.resetsAt ?? null) : k.until
+  return { until, startedAt: k.startedAt, lastPingAt: k.lastPingAt, source: 'keep' }
+}
+
+// Keep warm: one rule for every case. From each cache's last write to the target, pings at the
+// fewest equal gaps of at most 50 minutes, so the 60-minute cache is still warm at the end.
+// The person's own replies write the cache too, so it only pings while the session idles.
+// It stands down while a turn runs, at 100% of a limit (every request is refused), and for a
+// quota pause days long (a weekly window), where pings would cost more than they save.
+async function keepWarm($: EngineInterface): Promise<void> {
+  const tgt = await warmTarget($)
+  if (!tgt) return
   const now = await $.clock.now()
+  if (tgt.source === 'keep' && tgt.until !== null && now >= tgt.until) {
+    await update($, keep, () => NO_KEEP)
+    return
+  }
+  const p = await read($, pause)
   if (p.kind === 'quota' && !keepAliveWorth(p.until, now)) return
   if (spentNow(await read($, quota))) return
+  if ((await read($, warm)).busy) return
   const m = await read($, main)
 
-  if (planDue(pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until), p.lastPingAt, now)) {
-    await update($, pause, prev => ({ ...prev, lastPingAt: now }))
-    $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: keep-alive ping to the main session failed: ${(err as Error).message}`))
+  if (planDue(pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until), tgt.lastPingAt, now)) {
+    if (tgt.source === 'pause') await update($, pause, prev => ({ ...prev, lastPingAt: now }))
+    else await update($, keep, prev => ({ ...prev, lastPingAt: now }))
+    $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: keep-warm ping failed: ${(err as Error).message}`))
   }
 
+  if (tgt.source !== 'pause') return
   const map = await read($, agents)
   for (const [id, a] of Object.entries(map)) {
     if (a.status !== 'paused') continue
-    if (!planDue(pingPlan(cacheWrittenAt(a.lastCacheAt, p.startedAt), p.until), a.lastPingAt ?? 0, now)) continue
+    if (!planDue(pingPlan(cacheWrittenAt(a.lastCacheAt, tgt.startedAt), tgt.until), a.lastPingAt ?? 0, now)) continue
     await update($, agents, all => (all[id] ? { ...all, [id]: { ...all[id], lastPingAt: now } } : all))
     try {
       await $.session.send({ to: { agentId: id }, text: PING_AGENT })
     } catch (err) {
-      $.ui.log(`quota: keep-alive ping to subagent ${id} failed: ${(err as Error).message}`)
+      $.ui.log(`quota: keep-warm ping to subagent ${id} failed: ${(err as Error).message}`)
     }
   }
-}
-
-// What Stay warm would do now, from the readings and the session's state.
-async function warmPlanNow($: EngineInterface, opts: Options): Promise<WarmPlan> {
-  const now = await $.clock.now()
-  const cfg = await read($, warmCfg)
-  const w = await read($, warm)
-  const p = await read($, pause)
-  const q = await read($, quota)
-  const m = await read($, main)
-  const t = thresholdsOf(opts, await read($, overrides))
-  const percents = q.limits ? windowsOf(q.limits).map(x => x.win.percent) : []
-  return stayWarmPlan(
-    cfg,
-    {
-      paused: p.kind !== 'none',
-      busy: w.busy,
-      maxPercent: percents.length ? Math.max(...percents) : null,
-      headsUp: t.headsUp,
-      lastCacheAt: m.lastCacheAt,
-      lastWorkAt: w.lastWorkAt,
-      lastPingAt: w.lastPingAt,
-    },
-    now,
-  )
-}
-
-// Stay warm: while usage is low and the session idles, a ping each interval keeps the cache
-// alive for the person's return, up to the time limit they picked. Off unless they turn it on.
-async function stayWarm($: EngineInterface, opts: Options): Promise<void> {
-  const plan = await warmPlanNow($, opts)
-  if (!plan.due) return
-  const now = await $.clock.now()
-  await update($, warm, prev => ({ ...prev, lastPingAt: now }))
-  $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: stay-warm ping failed: ${(err as Error).message}`))
 }
 
 // The level that started a quota pause on this window: the 5-hour main stop, else the weekly stop.
@@ -314,8 +300,7 @@ async function tick($: EngineInterface, opts: Options): Promise<void> {
       await resume($, 'The time you gave has come.')
       return
     }
-    await keepAlive($)
-    await stayWarm($, opts)
+    await keepWarm($)
   } finally {
     ticking = false
   }
@@ -439,11 +424,11 @@ async function simulateOff($: EngineInterface): Promise<string> {
 
 // Settings the person changes in the panel; kept in $.store so they outlast the session.
 const STORE_KEY = 'settings'
-type Saved = { thresholds: Partial<Thresholds>; stayWarm?: StayWarm }
+type Saved = { thresholds: Partial<Thresholds> }
 
 async function saveSettings($: EngineInterface): Promise<void> {
   const ov = await read($, overrides)
-  const saved: Saved = { thresholds: ov.thresholds, stayWarm: await read($, warmCfg) }
+  const saved: Saved = { thresholds: ov.thresholds }
   try {
     await $.store.set(STORE_KEY, saved)
   } catch (err) {
@@ -467,15 +452,7 @@ async function loadSettings($: EngineInterface): Promise<void> {
     if (typeof v === 'number' && v >= 1 && v <= 100) thresholds[k] = v
   }
   await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: null }))
-  const w = raw.stayWarm
-  if (w && typeof w === 'object') {
-    const cfg: StayWarm = {
-      on: w.on === true,
-      everyMin: typeof w.everyMin === 'number' && w.everyMin >= 1 && w.everyMin <= 55 ? w.everyMin : STAY_WARM_DEFAULT.everyMin,
-      forHours: typeof w.forHours === 'number' && w.forHours > 0 && w.forHours <= 24 ? w.forHours : STAY_WARM_DEFAULT.forHours,
-    }
-    await update($, warmCfg, () => cfg)
-  }
+
 }
 
 const THRESHOLD_NAMES: Record<keyof Thresholds, string> = {
@@ -511,17 +488,32 @@ const SCENARIOS: { key: string; label: string; five: number; week: number }[] = 
   { key: 'week', label: 'Weekly stop', five: 40, week: 99.5 },
 ]
 
-async function setStayWarm($: EngineInterface, change: Partial<StayWarm>): Promise<string> {
-  const cfg = await update($, warmCfg, prev => ({ ...prev, ...change }))
-  await saveSettings($)
-  if (change.on === false) return 'Stay warm is off.'
-  if (change.on === true) return `Stay warm is on: a ping every ${cfg.everyMin}m while idle, up to ${cfg.forHours}h after your last prompt.`
-  if (change.everyMin !== undefined) return `Stay warm pings every ${cfg.everyMin}m.`
-  return `Stay warm keeps going up to ${cfg.forHours}h after your last prompt.`
+const KEEP_HOURS = [1, 2, 4] as const
+
+async function setKeep($: EngineInterface, choice: KeepState['choice']): Promise<string> {
+  const now = await $.clock.now()
+  const p = await read($, pause)
+  if (choice === 'off') {
+    await update($, keep, () => NO_KEEP)
+    return p.kind === 'none' ? 'Not keeping the cache warm.' : continueNow($)
+  }
+  const q = await read($, quota)
+  const reset = q.limits?.fiveHour?.resetsAt ?? null
+  if (choice === 'reset' && (reset === null || reset <= now)) return 'The 5-hour reset time is not known yet.'
+  const until = choice === 'reset' ? reset! : now + Number(choice) * HOUR
+  await update($, keep, () => ({ choice, until: choice === 'reset' ? null : until, startedAt: now, lastPingAt: 0 }))
+  // A pause the person set follows the new end; a limit's pause keeps waiting on its reset.
+  if (p.kind === 'time') await update($, pause, prev => ({ ...prev, until }))
+  return `Keeping the cache warm until ${new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+}
+
+async function pauseWork($: EngineInterface): Promise<string> {
+  const tgt = await warmTarget($)
+  if (!tgt || tgt.until === null) return 'Pick how long to keep warm first.'
+  return pauseAt($, tgt.until)
 }
 
 async function resetSettings($: EngineInterface): Promise<string> {
-  await update($, warmCfg, () => STAY_WARM_DEFAULT)
   await update($, overrides, prev => ({ ...prev, thresholds: {}, pingMinutes: null }))
   await update($, quota, prev => ({ ...prev, said: [] }))
   await saveSettings($)
@@ -560,12 +552,6 @@ export const register: Register = (on, options) => {
       void tick($, opts)
     })
     return started
-  })
-
-  on('prompt.submit', async ($, e, next) => {
-    const now = await $.clock.now()
-    await update($, warm, prev => ({ ...prev, lastWorkAt: now }))
-    return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
@@ -861,33 +847,21 @@ export const register: Register = (on, options) => {
     const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
     const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
     const spent = spentNow(q)
-    const wcfg = await read($, warmCfg)
-    const wp = await warmPlanNow($, opts)
+    const k = await read($, keep)
+    const tgt = await warmTarget($)
+    const busy = (await read($, warm)).busy
     const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    const warmWords: Record<WarmPlan['state'], string> = {
-      off: 'off',
-      paused: 'resting: the reset bridge has it',
-      high: 'resting: usage passed the heads-up level',
-      'no-cache': 'on: starts after your next reply',
-      busy: 'on: a turn is running',
-      done: `done: ${wcfg.forHours}h since your last prompt`,
-      waiting: 'on',
-    }
-    const warmLine = (
-      <>
-        <Text bold color={wcfg.on ? 'success' : undefined}>Stay warm</Text>
-        <Text dimColor={wp.state !== 'waiting'}>{warmWords[wp.state]}</Text>
-        {wp.state === 'waiting' && wp.next !== null ? stat(fmtDur(Math.max(0, wp.next - now)), 'to next ping', 'success') : null}
-        {wp.state === 'waiting' && wp.until !== null ? stat(clockAt(wp.until), 'until') : null}
-      </>
-    )
-    const plan = p.kind === 'none' || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until)
-    const pauseText =
-      p.kind === 'none'
-        ? 'Not paused'
-        : p.kind === 'quota'
-          ? `Paused for ${p.window}${p.until ? `, ${fmtDur(p.until - now)} to go` : ''}`
-          : `Paused until ${p.until ? new Date(p.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?'}`
+    const plan = !tgt || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
+    const chosen: KeepState['choice'] = p.kind === 'quota' ? 'reset' : k.choice
+    const statusText =
+      p.kind === 'quota'
+        ? `Work paused by the ${p.window}${p.until ? ` until ${clockAt(p.until)}` : ''}`
+        : p.kind === 'time'
+          ? `Work paused until ${p.until ? clockAt(p.until) : '?'}`
+          : tgt
+            ? `Keeping warm until ${tgt.until ? clockAt(tgt.until) : 'the reset'}`
+            : 'Not keeping warm'
+    const statusTone = p.kind !== 'none' ? 'warning' : tgt ? 'success' : undefined
 
     parts.push(
       card(
@@ -917,65 +891,45 @@ export const register: Register = (on, options) => {
             </Box>
           </Box>
           <Box gap={isRich ? 3 : 2} flexWrap="wrap" marginTop={isRich ? 1 : 0}>
-            <Text bold color={p.kind === 'none' ? undefined : 'warning'}>
-              {pauseText}
+            <Text bold color={statusTone}>
+              {statusText}
             </Text>
-            {p.kind !== 'none' ? <Text bold color="warning">Reset bridge</Text> : null}
-            {p.kind === 'none' ? (
-              warmLine
-            ) : spent ? (
+            {!tgt ? null : spent ? (
               <Text dimColor>no pings: the limit is at 100%, requests are refused</Text>
             ) : farOff ? (
               <Text dimColor>no pings: the reset is too far off</Text>
+            ) : busy ? (
+              <Text dimColor>a turn is running; it keeps the cache warm</Text>
             ) : plan === null ? (
-              <Text dimColor>no ping needed: the cache outlasts the wait</Text>
+              <Text dimColor>no ping needed: the cache lasts until then</Text>
             ) : (
               <>
-                {stat(fmtDur(Math.max(0, plan.next - now)), 'to next ping', 'warning')}
-                {plan.left !== null ? stat(String(plan.left), plan.left === 1 ? 'ping before reset' : 'pings before reset') : null}
+                {stat(fmtDur(Math.max(0, plan.next - now)), 'to next ping', statusTone)}
+                {plan.left !== null ? stat(String(plan.left), plan.left === 1 ? 'ping left' : 'pings left') : null}
                 {stat(`${Math.round(plan.gap / MINUTE)}m`, 'apart')}
               </>
             )}
           </Box>
-          {p.kind !== 'none' ? (
-            <Box marginTop={isRich ? 1 : 0}>
-              <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} />
-            </Box>
-          ) : null}
           <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
-            <Text dimColor>{p.kind === 'none' ? 'Pause for' : 'Move to'}</Text>
-            {[30, 60, 120, 180].map(min => (
-              <Button key={`pause-${min}`} label={min < 60 ? `${min}m` : `${min / 60}h`} onPress={() => act(() => pauseAt($, now + min * MINUTE))} />
+            <Text dimColor>Keep warm</Text>
+            <Button key="keep-off" label="Off" variant={chosen === 'off' && p.kind === 'none' ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, 'off'))} />
+            {KEEP_HOURS.map(hours => (
+              <Button key={`keep-${hours}`} label={`${hours}h`} variant={chosen === String(hours) ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, String(hours) as KeepState['choice']))} />
             ))}
             {l?.fiveHour?.resetsAt && l.fiveHour.resetsAt > now ? (
-              <Button key="pause-reset" label="Until 5-hour reset" onPress={() => act(() => pauseAt($, l.fiveHour!.resetsAt!))} />
+              <Button key="keep-reset" label="Until reset" variant={chosen === 'reset' ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, 'reset'))} />
             ) : null}
           </Box>
-          {/* Stay warm lives on the page: switched and tuned here, no trip to Settings. */}
-          <Box flexDirection="column" marginTop={isRich ? 1 : 0}>
-            <Box gap={1} alignItems="center" flexWrap="wrap">
-              <Text dimColor>Stay warm</Text>
-              <Button key="warm-off" label="Off" variant={wcfg.on ? 'secondary' : 'primary'} onPress={() => act(() => setStayWarm($, { on: false }))} />
-              <Button key="warm-on" label="On" variant={wcfg.on ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { on: true }))} />
-            </Box>
-            {wcfg.on ? (
-              <>
-                <Box gap={1} flexWrap="wrap" alignItems="center">
-                  <Text dimColor>Ping every</Text>
-                  {STAY_WARM_EVERY.map(v => (
-                    <Button key={`warm-every-${v}`} label={`${v}m`} variant={v === wcfg.everyMin ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { everyMin: v }))} />
-                  ))}
-                </Box>
-                <Box gap={1} flexWrap="wrap" alignItems="center">
-                  <Text dimColor>Away up to</Text>
-                  {STAY_WARM_FOR.map(v => (
-                    <Button key={`warm-for-${v}`} label={`${v}h`} variant={v === wcfg.forHours ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { forHours: v }))} />
-                  ))}
-                </Box>
-              </>
+          <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
+            {p.kind !== 'none' ? (
+              <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} />
+            ) : tgt ? (
+              <Button key="pause-work" label="Pause work until then" onPress={() => act(() => pauseWork($))} />
             ) : null}
-            <Text dimColor>Keeps the cache warm while you're away and usage is low. Rests at the heads-up level; each ping spends a little quota.</Text>
           </Box>
+          <Text dimColor>
+            Pings go out evenly up to the end, at most 50 minutes apart, so the 60-minute cache is still warm then. Your own replies count, so it only pings while you're away. A limit's stop level turns it on by itself, with work paused until the reset.
+          </Text>
         </>,
       ),
     )
@@ -1044,15 +998,6 @@ export const register: Register = (on, options) => {
             {row('subagentsStop', 'subagents pause, 5-hour')}
             {row('mainStop', 'main session pauses, 5-hour')}
             {row('weekStop', 'everything stops, weekly')}
-            <Box flexDirection="column" marginTop={1}>
-              <Box gap={1} alignItems="center">
-                <Text bold>Reset bridge</Text>
-                <Text bold color="success">automatic</Text>
-              </Box>
-              <Text dimColor>
-                When a limit pauses the work, pings are spread evenly up to the reset, at most 50 minutes apart, so the 60-minute cache is warm when work resumes. Stops at 100% of a limit, and for waits over 12 hours.
-              </Text>
-            </Box>
             <Box flexDirection="column" marginTop={1}>
               <Box gap={1} alignItems="center">
                 <Text bold>Test mode</Text>
