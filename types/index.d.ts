@@ -60,6 +60,15 @@ export type MainState = {
   lastCacheAt: number
 }
 
+// What Stay warm watches: the person's last prompt, its own last ping, and a running main turn.
+export type WarmFacts = {
+  lastWorkAt: number
+  lastPingAt: number
+  busy: boolean
+}
+
+export type StayWarmCfg = { on: boolean; everyMin: number; forHours: number }
+
 export type AgentState = {
   model: string
   tokens: number
@@ -79,6 +88,8 @@ declare module 'claude-code' {
       agents: Shaped<Record<string, AgentState>>
       said: Shaped<string>
       settingsOpen: Shaped<boolean>
+      warmCfg: Shaped<StayWarmCfg>
+      warm: Shaped<WarmFacts>
     }
   }
 }

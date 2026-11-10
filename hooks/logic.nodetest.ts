@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, limitSpent, pingPlan, planDue, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
+import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, STAY_WARM_DEFAULT, alertsFor, limitSpent, pingPlan, planDue, stayWarmPlan, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
 import type { Limits } from './logic.ts'
 
 const base = (over: Partial<Limits>): Limits => ({
@@ -158,4 +158,59 @@ test('a limit at 100% stands the keep-alive down', () => {
   assert.equal(limitSpent([99, 40]), false)
   assert.equal(limitSpent([100, 40]), true)
   assert.equal(limitSpent([null, 100.2]), true)
+})
+
+// The person's rule for the reset bridge, as they gave it: take the time to the reset, keep a
+// 10-minute margin off the 60-minute cache, and ping at equal steps so the cache never passes
+// 59 minutes old before the reset. Checked for every wait from 1 minute to 5 hours.
+test("person's rule: equal pings to the reset, 10-minute margin, the cache never reaches 59 minutes", () => {
+  for (let wait = 1; wait <= 300; wait++) {
+    const until = wait * MINUTE
+    let written = 0
+    const gaps: number[] = []
+    for (let guard = 0; guard < 20; guard++) {
+      const plan = pingPlan(written, until)
+      if (plan === null) break
+      gaps.push(plan.next - written)
+      written = plan.next // the ping lands and writes the cache
+    }
+    const ageAtReset = until - written
+    assert.ok(ageAtReset <= 50 * MINUTE, `wait ${wait}m: cache ${ageAtReset / MINUTE}m old at the reset`)
+    assert.ok(ageAtReset < 59 * MINUTE)
+    for (const g of gaps) {
+      assert.ok(g <= 50 * MINUTE, `wait ${wait}m: a gap of ${g / MINUTE}m passes the margin`)
+      assert.ok(Math.abs(g - gaps[0]!) < 1, `wait ${wait}m: gaps are not equal (${gaps.map(x => x / MINUTE)})`)
+    }
+    // The fewest pings that keep the margin: one fewer would need a gap over 50 minutes.
+    assert.equal(gaps.length, Math.max(0, Math.ceil(wait / 50) - 1), `wait ${wait}m`)
+  }
+})
+
+const facts = (over: Partial<Parameters<typeof stayWarmPlan>[1]> = {}) => ({
+  paused: false,
+  busy: false,
+  maxPercent: 20,
+  headsUp: 90,
+  lastCacheAt: 0 * MINUTE + 1,
+  lastWorkAt: 1,
+  lastPingAt: 0,
+  ...over,
+})
+const on = { ...STAY_WARM_DEFAULT, on: true, everyMin: 45, forHours: 2 }
+
+test('stay warm: idle and low usage, a ping every interval until the time limit', () => {
+  assert.equal(stayWarmPlan(STAY_WARM_DEFAULT, facts(), 50 * MINUTE).state, 'off')
+  assert.equal(stayWarmPlan(on, facts(), 44 * MINUTE).due, false)
+  assert.equal(stayWarmPlan(on, facts(), 46 * MINUTE).due, true)
+  // The ping landed at 46m: the next is 45 minutes on.
+  assert.equal(stayWarmPlan(on, facts({ lastCacheAt: 46 * MINUTE, lastPingAt: 46 * MINUTE }), 60 * MINUTE).next, 91 * MINUTE)
+  // Two hours after the last prompt it stops.
+  assert.equal(stayWarmPlan(on, facts({ lastCacheAt: 100 * MINUTE }), 121 * MINUTE).state, 'done')
+})
+
+test('stay warm stands aside: at the heads-up level, during a pause, during a turn, before any reply', () => {
+  assert.equal(stayWarmPlan(on, facts({ maxPercent: 90 }), 46 * MINUTE).state, 'high')
+  assert.equal(stayWarmPlan(on, facts({ paused: true }), 46 * MINUTE).state, 'paused')
+  assert.equal(stayWarmPlan(on, facts({ busy: true }), 46 * MINUTE).state, 'busy')
+  assert.equal(stayWarmPlan(on, facts({ lastCacheAt: 0 }), 46 * MINUTE).state, 'no-cache')
 })
