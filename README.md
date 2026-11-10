@@ -19,7 +19,12 @@ The pane follows the cache-countdown mod: rounded cards, a ring and a bar in gre
 
 ## Controls in the pane
 
-Everything works from the pane itself, so the desktop app needs no typed command: **Refresh**, **Continue now** (while paused), **End simulation** (in test mode), a **Pause until** field (type `15:45`, Enter) and a **Main model weekly %** field (the number from the usage card, or `off`). `/quota` still works where slash commands do, and opens the pane.
+The panel is the main view: everything is set and run from it, and nothing needs a typed command. `/quota` opens it.
+
+- **Refresh**, **Continue now** (while paused), a **Pause until** field (type `15:45`, Enter), and a **Percent** field for the main model's weekly limit (copy it from the usage card, or `off`).
+- **Settings** in the footer opens the settings card: the four alert and stop percents, the keep-alive ping interval, test mode (type `97 40` for a made-up 5-hour and weekly reading, **End test** to stop), and **Reset to defaults**. These are saved and used in every session.
+
+The typed forms still work where slash commands run: `/quota show` (the readings as text), `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 42` or `off`.
 
 ## Thresholds
 
@@ -40,7 +45,7 @@ When the window resets, or the time arrives, the main session is told to continu
 
 A ping is a real request, so it spends a little quota, and a ping to the main session appears as a visible row in the transcript.
 
-## Commands
+## Commands (optional)
 
 - `/quota` or `/quota show`: the readings and pause state
 - `/quota pause until 15:45`: pause until that time, keep alive
