@@ -951,6 +951,31 @@ export const register: Register = (on, options) => {
               <Button key="pause-reset" label="Until 5-hour reset" onPress={() => act(() => pauseAt($, l.fiveHour!.resetsAt!))} />
             ) : null}
           </Box>
+          {/* Stay warm lives on the page: switched and tuned here, no trip to Settings. */}
+          <Box flexDirection="column" marginTop={isRich ? 1 : 0}>
+            <Box gap={1} alignItems="center" flexWrap="wrap">
+              <Text dimColor>Stay warm</Text>
+              <Button key="warm-off" label="Off" variant={wcfg.on ? 'secondary' : 'primary'} onPress={() => act(() => setStayWarm($, { on: false }))} />
+              <Button key="warm-on" label="On" variant={wcfg.on ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { on: true }))} />
+            </Box>
+            {wcfg.on ? (
+              <>
+                <Box gap={1} flexWrap="wrap" alignItems="center">
+                  <Text dimColor>Ping every</Text>
+                  {STAY_WARM_EVERY.map(v => (
+                    <Button key={`warm-every-${v}`} label={`${v}m`} variant={v === wcfg.everyMin ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { everyMin: v }))} />
+                  ))}
+                </Box>
+                <Box gap={1} flexWrap="wrap" alignItems="center">
+                  <Text dimColor>Away up to</Text>
+                  {STAY_WARM_FOR.map(v => (
+                    <Button key={`warm-for-${v}`} label={`${v}h`} variant={v === wcfg.forHours ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { forHours: v }))} />
+                  ))}
+                </Box>
+              </>
+            ) : null}
+            <Text dimColor>Keeps the cache warm while you're away and usage is low. Rests at the heads-up level; each ping spends a little quota.</Text>
+          </Box>
         </>,
       ),
     )
@@ -1019,35 +1044,6 @@ export const register: Register = (on, options) => {
             {row('subagentsStop', 'subagents pause, 5-hour')}
             {row('mainStop', 'main session pauses, 5-hour')}
             {row('weekStop', 'everything stops, weekly')}
-            <Box flexDirection="column" marginTop={1}>
-              <Box gap={1} alignItems="center">
-                <Text bold>Stay warm</Text>
-                <Text bold color={wcfg.on ? 'success' : undefined}>{wcfg.on ? `every ${wcfg.everyMin}m, up to ${wcfg.forHours}h` : 'off'}</Text>
-              </Box>
-              <Text dimColor>
-                For everyday use, while quota is low: pings an idle session so its cache is still warm when you come back. Stops at the heads-up level and after the time you pick. Each ping spends a little quota.
-              </Text>
-              <Box gap={1} flexWrap="wrap" alignItems="center">
-                <Button key="warm-off" label="Off" variant={wcfg.on ? 'secondary' : 'primary'} onPress={() => act(() => setStayWarm($, { on: false }))} />
-                <Button key="warm-on" label="On" variant={wcfg.on ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { on: true }))} />
-              </Box>
-              {wcfg.on ? (
-                <>
-                  <Box gap={1} flexWrap="wrap" alignItems="center">
-                    <Text dimColor>Ping every</Text>
-                    {STAY_WARM_EVERY.map(v => (
-                      <Button key={`warm-every-${v}`} label={`${v}m`} variant={v === wcfg.everyMin ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { everyMin: v }))} />
-                    ))}
-                  </Box>
-                  <Box gap={1} flexWrap="wrap" alignItems="center">
-                    <Text dimColor>Away for up to</Text>
-                    {STAY_WARM_FOR.map(v => (
-                      <Button key={`warm-for-${v}`} label={`${v}h`} variant={v === wcfg.forHours ? 'primary' : 'secondary'} onPress={() => act(() => setStayWarm($, { forHours: v }))} />
-                    ))}
-                  </Box>
-                </>
-              ) : null}
-            </Box>
             <Box flexDirection="column" marginTop={1}>
               <Box gap={1} alignItems="center">
                 <Text bold>Reset bridge</Text>

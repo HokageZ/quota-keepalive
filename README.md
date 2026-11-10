@@ -42,7 +42,7 @@ The mod keeps the prompt cache warm in two separate ways, each named in the pane
 
 ### Stay warm (everyday, off by default)
 
-For normal use while quota is low: when the session sits idle, a ping every 15, 30, 45 or 55 minutes keeps its cache warm for when you come back, for up to 1, 2, 4 or 8 hours after your last prompt. All of it is picked in Settings. It rests at the heads-up level, during a pause (the reset bridge takes over), while a turn runs, and before the first reply. The time limit counts from your last prompt, never from a ping, so it always ends. Each ping spends a little quota, which is why it starts off.
+For normal use while quota is low: when the session sits idle, a ping every 15, 30, 45 or 55 minutes keeps its cache warm for when you come back, for up to 1, 2, 4 or 8 hours after your last prompt. All of it is picked on the panel itself, on the prompt cache card. It rests at the heads-up level, during a pause (the reset bridge takes over), while a turn runs, and before the first reply. The time limit counts from your last prompt, never from a ping, so it always ends. Each ping spends a little quota, which is why it starts off.
 
 ### Reset bridge (automatic)
 
