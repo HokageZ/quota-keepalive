@@ -121,3 +121,12 @@ test('a quota pause ends on the reset time or a reading back under the level', (
   assert.equal(quotaBack(null, 10, 3, 98), true)
   assert.equal(quotaBack(100, 10, null, 98), false)
 })
+
+test('a reset time that drifts by seconds does not say a threshold again', () => {
+  const t = DEFAULT_THRESHOLDS
+  const at = (resetsAt: number) => ({ fiveHour: { label: '5-hour limit', percent: 91, resetsAt }, weekAll: null, weekModel: null })
+  const first = alertsFor(at(10 * HOUR), t, [])
+  assert.equal(first.length, 1)
+  assert.equal(alertsFor(at(10 * HOUR + 7_000), t, first.map(a => a.id)).length, 0)
+  assert.equal(alertsFor(at(15 * HOUR), t, first.map(a => a.id)).length, 1)
+})

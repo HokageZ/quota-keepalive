@@ -13,6 +13,10 @@ A pane named **Quota** beside the chat, refreshed once a minute, with the readin
 - the main session's cache age and its next ping, when a pause runs;
 - each subagent: model, status, tokens so far, cache age, and which weekly window it spends (a subagent on the main model spends the model window; any other model spends the all-models window only).
 
+## Look
+
+The pane follows the cache-countdown mod: rounded cards, a ring and a bar in green, amber and red (amber from the heads-up level, red from the stop level), bold values with dim labels. Each limit's bar marks its thresholds. The terminal draws the same cards with block characters.
+
 ## Controls in the pane
 
 Everything works from the pane itself, so the desktop app needs no typed command: **Refresh**, **Continue now** (while paused), **End simulation** (in test mode), a **Pause until** field (type `15:45`, Enter) and a **Main model weekly %** field (the number from the usage card, or `off`). `/quota` still works where slash commands do, and opens the pane.
@@ -58,9 +62,10 @@ Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `heads
 
 ## Files
 
-- `hooks/logic.ts`: pure rules (thresholds, pace, pause timing); `hooks/logic.test.ts` runs with `node --test hooks/logic.test.ts`
+- `hooks/logic.ts`: pure rules (thresholds, pace, pause timing); `hooks/logic.nodetest.ts` runs with `node --test hooks/logic.nodetest.ts`
 - `hooks/register.test.tsx`: the pane on terminal and desktop, and the keep-alive timing; runs with `claude plugin test .`
 - `hooks/register.tsx`: the engine hooks, pane and commands
+- `hooks/view.ts`: the pane's tones, ring, bar and block helpers
 - `types/index.d.ts`: the state contract
 
 ## Install

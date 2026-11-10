@@ -20,6 +20,8 @@ const PANE = {
 // The engine beneath the mod: plan readings, prompts it submits, agents, commands.
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], readings: { five: number; week: number; weekResetsIn: number }, now: () => number) {
   const pings: string[] = []
+  const start = now()
+  on('ui.toast', () => ({ value: undefined }))
   on('command.register', () => ({ value: { command: 'quota' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -29,8 +31,8 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], readings: { five:
       startedAt: 0,
       context: { window: 200_000, percent: 10 },
       rateLimits: [
-        { kind: 'five_hour', percentUsed: readings.five, resetsAt: new Date(now() + 3 * HOUR).toISOString() },
-        { kind: 'seven_day', percentUsed: readings.week, resetsAt: new Date(now() + readings.weekResetsIn).toISOString() },
+        { kind: 'five_hour', percentUsed: readings.five, resetsAt: new Date(start + 3 * HOUR).toISOString() },
+        { kind: 'seven_day', percentUsed: readings.week, resetsAt: new Date(start + readings.weekResetsIn).toISOString() },
       ],
     },
   }))
@@ -49,7 +51,8 @@ test('the pane draws its controls on every surface, and a pause starts from the 
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /5-hour limit: 20% used/ }))?.text).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /^5-hour limit$/ }))?.text).toBeTruthy()
+    expect((await ui.find({ type: 'Text', text: /^20%$/ }))?.text).toBeTruthy()
     expect(await ui.find({ key: 'refresh' })).toBeTruthy()
     expect(await ui.find({ key: 'pause-until' })).toBeTruthy()
     expect(await ui.find({ key: 'model-week' })).toBeTruthy()
@@ -66,7 +69,7 @@ test('the pane draws its controls on every surface, and a pause starts from the 
 
   await ui.press({ key: 'continue' })
   await clock.settle()
-  expect((await ui.find({ type: 'Text', text: /Pause: none/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Not paused$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
 
@@ -99,6 +102,6 @@ test('a weekly quota pause days from its reset sends no keep-alive pings', async
   expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /Paused for quota/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Paused for Weekly/ }))?.text).toBeTruthy()
   await ui.unmount()
 })

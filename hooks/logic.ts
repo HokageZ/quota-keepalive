@@ -59,7 +59,8 @@ export function windowsOf(l: Limits): { key: 'fiveHour' | 'weekAll' | 'weekModel
 export function alertsFor(l: Limits, t: Thresholds, said: string[]): Alert[] {
   const out: Alert[] = []
   const add = (level: Level, key: string, win: Window, text: string) => {
-    const id = `${key}:${level}:${win.resetsAt ?? 'none'}`
+    // The reset time to the nearest 10 minutes: a reading that drifts by seconds is the same window.
+    const id = `${key}:${level}:${win.resetsAt === null ? 'none' : Math.round(win.resetsAt / (10 * MINUTE))}`
     if (said.includes(id)) return
     out.push({ id, level, window: win.label, percent: win.percent, text })
   }
