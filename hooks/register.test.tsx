@@ -319,8 +319,16 @@ test('the band above the prompt: cache time left and what to re-cache; Settings 
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const band = await $.ui.mount({ ...BAND, surface })
-    expect((await band.find({ type: 'Text', text: /^Prompt cache$/ }))?.text).toBeTruthy()
-    expect((await band.find({ type: 'Text', text: /^45m left$/ }))?.text).toBeTruthy()
+    expect((await band.find({ type: 'Text', text: surface === 'desktop' ? /^Prompt cache$/ : /cache$/ }))?.text).toBeTruthy()
+    // cache-countdown's own wording on each surface.
+    if (surface === 'desktop') {
+      expect((await band.find({ type: 'Text', text: /^45 min left$/ }))?.text).toBeTruthy()
+      expect((await band.find({ type: 'Text', text: /^of 60 min$/ }))?.text).toBeTruthy()
+      expect((await band.find({ type: 'Text', text: /^to re-cache$/ }))?.text).toBeTruthy()
+    } else {
+      expect((await band.find({ type: 'Text', text: /^45m$/ }))?.text).toBeTruthy()
+      expect((await band.find({ type: 'Text', text: /^re-cache$/ }))?.text).toBeTruthy()
+    }
     // 10 input + 50,000 read + 20 output: the next message re-caches about 50k tokens.
     expect((await band.find({ type: 'Text', text: /^50k$/ }))?.text).toBeTruthy()
     // No hit rate or misses here, and no warning at 20%.

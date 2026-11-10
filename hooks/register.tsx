@@ -1120,67 +1120,151 @@ export const register: Register = (on, options) => {
       await $.ui.open({ id: PANE, title: 'Quota' })
     }
 
-    const cachePart = (
-      <Box gap={1} alignItems="center" flexShrink={0}>
-        {Svg ? (
-          <Svg source={ringSvg(share, tone)} alt={left === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${fmtDur(Math.max(0, left))} left`} width={18} height={18} />
-        ) : (
-          <Text color={tone}>{left !== null && left > 0 ? '●' : '○'}</Text>
-        )}
-        <Text bold>Prompt cache</Text>
-        {left === null ? (
-          <Text dimColor>no reply yet</Text>
-        ) : left > 0 ? (
-          <>
-            <Text bold color={tone}>
-              {fmtDur(left)} left
-            </Text>
-            {isNarrow ? null : <Text dimColor>of {ttl === HOUR ? '60m' : '5m'}</Text>}
-          </>
-        ) : (
-          <Text bold color="error">
-            Expired
-          </Text>
-        )}
-        {recache && !isNarrow ? (
-          <>
-            <Text dimColor>· re-cache</Text>
-            <Text bold>{recache}</Text>
-          </>
-        ) : null}
-      </Box>
-    )
+    // The band is cache-countdown's own drawing, copied as it is (its ring, its desktop row, its
+    // terminal row with the block bar); only the stats on the right are ours: what to re-cache,
+    // our warning or the ping plan, and Settings.
+    if (left === null) return below
+    const v = {
+      isWarm: left > 0,
+      tone,
+      ttl: ttl === HOUR ? '1h' : '5m',
+      share,
+      ms: Math.max(0, left),
+      left:
+        left >= HOUR
+          ? `${Math.floor(left / HOUR)}h ${Math.floor((left % HOUR) / 60000)}m`
+          : left >= 60 * 1000
+            ? `${Math.ceil(left / 60000)}m`
+            : `${Math.ceil(Math.max(0, left) / 1000)}s`,
+      recache: recache ?? '0',
+    }
+    const minutes = (ms: number) => (ms >= 60 * 1000 ? `${Math.ceil(ms / 60000)} min` : `${Math.ceil(ms / 1000)} sec`)
 
-    const ours = (
-      <Box
-        borderStyle="round"
-        borderDimColor={!warning && !tgt}
-        borderColor={warning ? warning.tone : tgt ? 'warning' : undefined}
-        paddingX={1}
-        alignItems="center"
-        justifyContent="space-between"
-        gap={2}
-        flexWrap="wrap"
-      >
-        {cachePart}
-        <Box gap={2} alignItems="center" flexShrink={1} flexWrap="wrap">
-          {holdText ? (
-            <Box gap={1} alignItems="center">
-              <Text bold color="warning">
-                {holdText}
-              </Text>
-              {planText && !isNarrow ? <Text dimColor>{planText}</Text> : null}
-            </Box>
-          ) : null}
-          {warning && !holdText ? (
-            <Text bold color={warning.tone}>
-              {warning.text}
-            </Text>
-          ) : null}
-          <Button key="band-settings" label="Settings" onPress={() => void openPanel()} />
+    // Ours, after the re-cache stat: the ping plan while paused or kept warm, else the warning; then Settings.
+    const extras = () => [
+      holdText ? (
+        <Box key="hold" gap={1} alignItems="center">
+          <Text bold color="warning">
+            {holdText}
+          </Text>
+          {planText && !isNarrow ? <Text dimColor>{planText}</Text> : null}
         </Box>
-      </Box>
-    )
+      ) : null,
+      warning && !holdText ? (
+        <Text key="warning" bold color={warning.tone}>
+          {warning.text}
+        </Text>
+      ) : null,
+      <Button key="band-settings" label="Settings" onPress={() => void openPanel()} />,
+    ]
+
+    let ours: RenderChildren
+    if (isRich && Svg) {
+      const stat = (value: string, label: string) => (
+        <Box key={label} gap={1} alignItems="center">
+          <Text bold>{value}</Text>
+          <Text dimColor>{label}</Text>
+        </Box>
+      )
+
+      const alt = v.isWarm
+        ? `Prompt cache warm, ${minutes(v.ms)} left`
+        : `Prompt cache cold, next message re-caches ${v.recache} tokens`
+
+      ours = (
+        <Box borderStyle="round" borderDimColor paddingX={1} alignItems="center" justifyContent="space-between" gap={3}>
+          <Box gap={1} alignItems="center" flexShrink={0}>
+            <Svg source={ringSvg(v.isWarm ? v.share : 0, v.tone)} alt={alt} width={18} height={18} />
+            <Text bold>Prompt cache</Text>
+            {v.isWarm ? (
+              <Box gap={1} alignItems="center">
+                <Text color={v.tone} bold>
+                  {minutes(v.ms)} left
+                </Text>
+                <Text dimColor>of {v.ttl === '1h' ? '60 min' : '5 min'}</Text>
+              </Box>
+            ) : (
+              <Text color={v.tone} bold>
+                Expired
+              </Text>
+            )}
+          </Box>
+          {v.isWarm ? (
+            <Box gap={3} alignItems="center" flexShrink={0}>
+              {isNarrow ? null : stat(v.recache, 'to re-cache')}
+              {extras()}
+            </Box>
+          ) : (
+            <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap">
+              <Box gap={1} alignItems="center">
+                <Text dimColor>Next message re-caches</Text>
+                <Text bold>{v.recache} tokens</Text>
+              </Box>
+              {extras()}
+            </Box>
+          )}
+        </Box>
+      )
+    } else {
+      const stat = (label: string, value: string) => (
+        <Box key={label} gap={1}>
+          <Text dimColor>{label}</Text>
+          <Text bold>{value}</Text>
+        </Box>
+      )
+
+      const status = (
+        <Box gap={1} flexShrink={0}>
+          <Text color={v.tone} bold>
+            {v.isWarm ? '●' : '○'} cache
+          </Text>
+          <Text color={v.tone}>{v.isWarm ? 'warm' : 'cold'}</Text>
+          {v.isWarm ? <Text dimColor>{v.ttl} ttl</Text> : null}
+        </Box>
+      )
+
+      if (!v.isWarm) {
+        ours = (
+          <Box borderStyle="round" borderColor={v.tone} paddingX={1} gap={2} flexWrap="wrap">
+            {status}
+            <Box gap={1}>
+              <Text dimColor>next message re-caches</Text>
+              <Text bold color={v.tone}>
+                {v.recache} tokens
+              </Text>
+            </Box>
+            {extras()}
+          </Box>
+        )
+      } else {
+        // The bar takes what the row leaves: status and time on the left, the
+        // stats column on the right when there is room for it.
+        const cells = Math.max(6, Math.min(28, e.props.bodyColumns - (isNarrow ? 40 : 94)))
+        const filled = Math.max(1, Math.round(v.share * cells))
+
+        ours = (
+          <Box borderStyle="round" borderColor={v.tone} borderDimColor={v.tone === 'success'} paddingX={1} justifyContent="space-between" gap={2}>
+            <Box gap={2} flexShrink={0}>
+              {status}
+              <Box gap={1}>
+                <Text>
+                  <Text color={v.tone}>{'█'.repeat(filled)}</Text>
+                  <Text dimColor>{'░'.repeat(cells - filled)}</Text>
+                </Text>
+                <Text bold color={v.tone}>
+                  {v.left}
+                </Text>
+                <Text dimColor>left</Text>
+              </Box>
+            </Box>
+            <Box gap={2} flexShrink={0}>
+              {isNarrow ? null : stat('re-cache', v.recache)}
+              {extras()}
+            </Box>
+          </Box>
+        )
+      }
+    }
 
     return (
       <Box flexDirection="column">
