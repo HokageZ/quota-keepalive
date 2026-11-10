@@ -85,6 +85,7 @@ export function paceOf(samples: Sample[], key: 'fiveHour' | 'weekAll', now: numb
   if (pts.length < 2) return null
   const first = pts[0]
   const last = pts[pts.length - 1]
+  if (!first || !last) return null
   const hours = (last.at - first.at) / HOUR
   if (hours <= 0) return null
   const delta = (last[key] as number) - (first[key] as number)
@@ -112,6 +113,38 @@ export function pingDue(lastPingAt: number, now: number, everyMs: number): boole
   return now - lastPingAt >= everyMs
 }
 
+// A failed or unanswered ping is tried again after this, not after a whole interval.
+export const PING_RETRY = 5 * MINUTE
+
+// When the cache was last written, as far as the mod knows: the last cached request,
+// or the pause start when no request was seen (a session that never ran a turn).
+export function cacheWrittenAt(lastCacheAt: number, startedAt: number): number {
+  return lastCacheAt > 0 ? lastCacheAt : startedAt
+}
+
+// Is a keep-alive ping due for one cache: its last write is `everyMs` old, and no ping
+// went out in the last PING_RETRY (a ping still in flight, or one that failed, is retried then).
+export function cachePingDue(writtenAt: number, lastPingAt: number, now: number, everyMs: number): boolean {
+  return now - writtenAt >= everyMs && now - lastPingAt >= PING_RETRY
+}
+
+// Pings stop paying past this: a ping reads the whole context at the cache-read price,
+// one every 45 minutes over 12 hours costs about what rebuilding the cache once does.
+export const KEEPALIVE_HORIZON = 12 * HOUR
+
+// Is keeping the cache warm worth it for a pause ending at `until`? An unknown end or one
+// past the horizon (a weekly window days away) is not: pings would spend the very quota that ran out.
+export function keepAliveWorth(until: number | null, now: number, horizon = KEEPALIVE_HORIZON): boolean {
+  return until !== null && until - now <= horizon
+}
+
+// Has the window a quota pause waits on come back: its reset time passed, or a fresh
+// reading shows it under the level that paused it (the reset the mod never saw a time for).
+export function quotaBack(until: number | null, now: number, percent: number | null, stopAt: number): boolean {
+  if (resetPassed(until, now)) return true
+  return percent !== null && percent < stopAt
+}
+
 // Parse "15:45" or "9:05" into the next epoch ms at that local time (today, or tomorrow when it has passed).
 export function nextClock(hhmm: string, now: number): number | null {
   const m = /^(\d{1,2}):(\d{2})$/.exec(hhmm.trim())
@@ -136,7 +169,7 @@ export function fmtDur(ms: number): string {
 // Which family of model: 'opus', 'sonnet', 'haiku', 'fable', or the id as it came.
 export function familyOf(model: string): string {
   const m = /(fable|mythos|opus|sonnet|haiku)/i.exec(model)
-  return m ? m[1].toLowerCase() : model.toLowerCase()
+  return m?.[1] ? m[1].toLowerCase() : model.toLowerCase()
 }
 
 // A subagent spends the weekly window of its own model; the all-models window is spent by every model.

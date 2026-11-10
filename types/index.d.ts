@@ -65,6 +65,8 @@ export type AgentState = {
   tokens: number
   lastCacheAt: number
   status: 'running' | 'paused' | 'finished'
+  // When the mod last pinged this subagent; absent before the first ping.
+  lastPingAt?: number
 }
 
 declare module 'claude-code' {
@@ -75,6 +77,7 @@ declare module 'claude-code' {
       pause: Shaped<PauseState>
       main: Shaped<MainState>
       agents: Shaped<Record<string, AgentState>>
+      said: Shaped<string>
     }
   }
 }

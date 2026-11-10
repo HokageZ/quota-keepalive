@@ -7,12 +7,14 @@ import {
   HOUR,
   MINUTE,
   alertsFor,
+  cachePingDue,
+  cacheWrittenAt,
   fmtDur,
+  keepAliveWorth,
   nextClock,
   outlookOf,
   paceOf,
-  pingDue,
-  resetPassed,
+  quotaBack,
   spendsWindow,
   windowsOf,
 } from './logic'
@@ -30,8 +32,10 @@ const PING_AGENT = 'Keep-alive ping from the quota mod. Reply with the single wo
 
 const quota = atom({ plugin: 'quota-keepalive', key: 'quota' } as const, { limits: null, samples: [], said: [], refreshedAt: 0, needsRefresh: true, unavailable: '' } as QuotaState, { shape: SHAPE })
 const overrides = atom({ plugin: 'quota-keepalive', key: 'overrides' } as const, { thresholds: {}, simulate: null, weekModelPercent: null, pingMinutes: null } as Overrides, { shape: SHAPE })
-const pause = atom({ plugin: 'quota-keepalive', key: 'pause' } as const, { kind: 'none', until: null, window: '', startedAt: 0, lastPingAt: 0, reason: '' } as PauseState, { shape: SHAPE })
+const NO_PAUSE: PauseState = { kind: 'none', until: null, window: '', startedAt: 0, lastPingAt: 0, reason: '' }
+const pause = atom({ plugin: 'quota-keepalive', key: 'pause' } as const, NO_PAUSE, { shape: SHAPE })
 const main = atom({ plugin: 'quota-keepalive', key: 'main' } as const, { model: '', lastTurnAt: 0, lastCacheAt: 0 } as MainState, { shape: SHAPE })
+const said = atom({ plugin: 'quota-keepalive', key: 'said' } as const, '' as string, { shape: SHAPE })
 const agents = atom({ plugin: 'quota-keepalive', key: 'agents' } as const, {} as Record<string, AgentState>, { shape: SHAPE })
 
 type Options = Record<string, unknown>
@@ -165,7 +169,7 @@ async function startPause($: EngineInterface, kind: 'quota' | 'time', window: st
   const q = await read($, quota)
   const limits = q.limits
   const resets = kind === 'time' ? until : windowEnd(limits, window)
-  await update($, pause, () => ({ kind, until: resets, window, startedAt: now, lastPingAt: now, reason: window }))
+  await update($, pause, () => ({ kind, until: resets, window, startedAt: now, lastPingAt: 0, reason: window }))
 }
 
 function windowEnd(limits: QuotaLimits | null, label: string): number | null {
@@ -178,7 +182,7 @@ function windowEnd(limits: QuotaLimits | null, label: string): number | null {
 async function resume($: EngineInterface, why: string): Promise<string> {
   const p = await read($, pause)
   if (p.kind === 'none') return 'Nothing is paused.'
-  await update($, pause, () => ({ kind: 'none', until: null, window: '', startedAt: 0, lastPingAt: 0, reason: '' }))
+  await update($, pause, () => NO_PAUSE)
   const list = await $.agent.list()
   const map = await read($, agents)
   for (const a of list) {
@@ -186,37 +190,81 @@ async function resume($: EngineInterface, why: string): Promise<string> {
       await $.session.send({ to: { agentId: a.id }, text: `${why} Continue the work from where you stopped.` })
     }
   }
-  await update($, agents, m => Object.fromEntries(Object.entries(m).map(([id, a]) => [id, a.status === 'paused' ? { ...a, status: 'running' } : a])))
+  await update($, agents, m => Object.fromEntries(Object.entries(m).map(([id, a]) => [id, a.status === 'paused' ? { ...a, status: 'running' as const } : a])))
   void $.prompt.submit({ text: `${why} Continue the work from where you stopped.` })
   return why
 }
 
-// Pings the main session and each paused subagent, once per interval, while a pause runs.
+// Pings the main session and each paused subagent while a pause runs: each cache on its own
+// clock, from when it was last written, so a cache already old when the pause began is not lost.
 async function keepAlive($: EngineInterface, opts: Options): Promise<void> {
   const p = await read($, pause)
   if (p.kind === 'none') return
   const now = await $.clock.now()
+  // A quota pause days long (a weekly window) is not kept warm: the pings would spend
+  // the quota that ran out, and cost more than rebuilding the cache once.
+  if (p.kind === 'quota' && !keepAliveWorth(p.until, now)) return
   const ov = await read($, overrides)
-  if (!pingDue(p.lastPingAt, now, pingMs(opts, ov))) return
-  await update($, pause, prev => ({ ...prev, lastPingAt: now }))
-  void $.prompt.submit({ text: PING_MAIN })
+  const every = pingMs(opts, ov)
+  const m = await read($, main)
+
+  if (cachePingDue(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.lastPingAt, now, every)) {
+    await update($, pause, prev => ({ ...prev, lastPingAt: now }))
+    $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: keep-alive ping to the main session failed: ${(err as Error).message}`))
+  }
+
   const map = await read($, agents)
   for (const [id, a] of Object.entries(map)) {
-    if (a.status === 'paused') await $.session.send({ to: { agentId: id }, text: PING_AGENT })
+    if (a.status !== 'paused') continue
+    if (!cachePingDue(cacheWrittenAt(a.lastCacheAt, p.startedAt), a.lastPingAt ?? 0, now, every)) continue
+    await update($, agents, all => (all[id] ? { ...all, [id]: { ...all[id], lastPingAt: now } } : all))
+    try {
+      await $.session.send({ to: { agentId: id }, text: PING_AGENT })
+    } catch (err) {
+      $.ui.log(`quota: keep-alive ping to subagent ${id} failed: ${(err as Error).message}`)
+    }
   }
 }
 
+// The level that started a quota pause on this window: the 5-hour main stop, else the weekly stop.
+function stopLevelOf(window: string, t: Thresholds): number {
+  return window === '5-hour limit' ? t.mainStop : t.weekStop
+}
+
+// One pass at a time: a slow refresh must not let the next minute's pass start beside it.
+let ticking = false
+
 // One pass, once a minute: refresh when due, judge thresholds, end pauses, ping.
 async function tick($: EngineInterface, opts: Options): Promise<void> {
-  const now = await $.clock.now()
-  const q = await read($, quota)
-  if (q.needsRefresh || !q.limits || now - q.refreshedAt >= refreshMs(opts)) await refresh($)
-  await judge($, opts)
+  if (ticking) return
+  ticking = true
+  try {
+    const now = await $.clock.now()
+    const q = await read($, quota)
+    if (q.needsRefresh || !q.limits || now - q.refreshedAt >= refreshMs(opts)) await refresh($)
+    await judge($, opts)
 
-  const p = await read($, pause)
-  if (p.kind === 'quota' && resetPassed(p.until, now)) await resume($, 'The quota window reset.')
-  else if (p.kind === 'time' && p.until !== null && now >= p.until) await resume($, 'The time you gave has come.')
-  else await keepAlive($, opts)
+    const p = await read($, pause)
+    if (p.kind === 'quota') {
+      const fresh = await read($, quota)
+      const win = fresh.limits ? windowsOf(fresh.limits).find(w => w.win.label === p.window)?.win ?? null : null
+      // A pause begun before the reset time was known learns it from a later reading.
+      if (p.until === null && win?.resetsAt) await update($, pause, prev => ({ ...prev, until: win.resetsAt }))
+      const t = thresholdsOf(opts, await read($, overrides))
+      // Only a reading taken after the pause began can say the window came back.
+      const readAfter = fresh.limits !== null && fresh.limits.at > p.startedAt
+      if (quotaBack(p.until ?? win?.resetsAt ?? null, now, readAfter && win ? win.percent : null, stopLevelOf(p.window, t))) {
+        await resume($, 'The quota window reset.')
+        return
+      }
+    } else if (p.kind === 'time' && p.until !== null && now >= p.until) {
+      await resume($, 'The time you gave has come.')
+      return
+    }
+    await keepAlive($, opts)
+  } finally {
+    ticking = false
+  }
 }
 
 // Plain-language rows for the pane; read only.
@@ -261,7 +309,12 @@ async function rows($: EngineInterface, opts: Options): Promise<string[]> {
 
   if (m.lastCacheAt) {
     const age = now - m.lastCacheAt
-    const due = p.kind === 'none' ? 'no pings (not paused)' : `next ping in ${fmtDur(Math.max(0, p.lastPingAt + pingMs(opts, ov) - now))}`
+    const due =
+      p.kind === 'none'
+        ? 'no pings (not paused)'
+        : p.kind === 'quota' && !keepAliveWorth(p.until, now)
+          ? 'no pings: the pause ends too far off to keep the cache warm'
+          : `next ping in ${fmtDur(Math.max(0, m.lastCacheAt + pingMs(opts, ov) - now))}`
     out.push(`Main cache: ${fmtDur(age)} old; ${due}`)
   }
   out.push('Overage: a mod cannot see it. If the session enters extra usage, the cache drops to 5 minutes.')
@@ -282,6 +335,41 @@ async function rows($: EngineInterface, opts: Options): Promise<string[]> {
     out.push(`  ${a.description || a.type} · ${modelLabel} · ${status} · ${s?.tokens ?? 0} tokens · ${cache}${spend ? ' · ' + spend : ''}`)
   }
   return out
+}
+
+// What /quota and the pane's controls do; each answers the line to show.
+async function pauseUntil($: EngineInterface, hhmm: string): Promise<string> {
+  const now = await $.clock.now()
+  const at = nextClock(hhmm, now)
+  if (at === null) return 'Use a clock time, like 15:45.'
+  await update($, pause, () => NO_PAUSE)
+  await startPause($, 'time', 'time', now, at)
+  await tellMain($, `[quota mod] The person paused you until ${new Date(at).toLocaleTimeString()}. Stop starting work; finish only what is in hand and report. The mod keeps the cache warm and will tell you to continue.`)
+  await tellRunningAgents($, 'The person paused the work. Stop at a clean point, save what you have, and reply "paused for quota".')
+  return `Paused until ${new Date(at).toLocaleTimeString()}; keep-alive pings on.`
+}
+
+async function continueNow($: EngineInterface): Promise<string> {
+  const why = await resume($, 'The person said to continue.')
+  return why === 'Nothing is paused.' ? why : 'Continuing.'
+}
+
+async function setModelPercent($: EngineInterface, raw: string): Promise<string> {
+  if (raw.trim() === 'off' || raw.trim() === '') {
+    await update($, overrides, prev => ({ ...prev, weekModelPercent: null }))
+    return 'Per-model weekly reading cleared.'
+  }
+  const pct = Number(raw.replace('%', ''))
+  if (!Number.isFinite(pct) || pct < 0 || pct > 100) return 'Use a percent from 0 to 100, or off.'
+  await update($, overrides, prev => ({ ...prev, weekModelPercent: pct }))
+  await update($, quota, prev => ({ ...prev, needsRefresh: true }))
+  return `Per-model weekly set to ${pct}% by hand.`
+}
+
+async function simulateOff($: EngineInterface): Promise<string> {
+  await update($, overrides, prev => ({ ...prev, simulate: null }))
+  await update($, quota, prev => ({ ...prev, needsRefresh: true, said: [] }))
+  return 'Simulation off: live values again.'
 }
 
 function paceWords(hoursToFull: number | null, lastsToReset: boolean | null): string {
@@ -353,23 +441,16 @@ export const register: Register = (on, options) => {
 
     if (verb === '' || verb === 'show') {
       await refresh($)
+      void $.ui.open({ id: PANE, title: 'Quota' })
       return { text: (await rows($, opts)).join('\n') }
     }
 
     if (verb === 'pause') {
       if (a !== 'until') return { text: 'Use: /quota pause until HH:MM' }
-      const at = nextClock(b, now)
-      if (at === null) return { text: 'Use a clock time: /quota pause until 15:45' }
-      await startPause($, 'time', 'time', now, at)
-      await tellMain($, `[quota mod] The person paused you until ${new Date(at).toLocaleTimeString()}. Stop starting work; finish only what is in hand and report. The mod keeps the cache warm and will tell you to continue.`)
-      await tellRunningAgents($, 'The person paused the work. Stop at a clean point, save what you have, and reply "paused for quota".')
-      return { text: `Paused until ${new Date(at).toLocaleTimeString()}; keep-alive pings on.` }
+      return { text: await pauseUntil($, b) }
     }
 
-    if (verb === 'continue') {
-      const why = await resume($, 'The person said to continue.')
-      return { text: why === 'Nothing is paused.' ? why : 'Continuing.' }
-    }
+    if (verb === 'continue') return { text: await continueNow($) }
 
     if (verb === 'threshold') {
       const names: Record<string, keyof Thresholds> = { 'heads-up': 'headsUp', subagents: 'subagentsStop', main: 'mainStop', week: 'weekStop' }
@@ -382,11 +463,7 @@ export const register: Register = (on, options) => {
     }
 
     if (verb === 'simulate') {
-      if (a === 'off') {
-        await update($, overrides, prev => ({ ...prev, simulate: null }))
-        await update($, quota, prev => ({ ...prev, needsRefresh: true, said: [] }))
-        return { text: 'Simulation off: live values again.' }
-      }
+      if (a === 'off') return { text: await simulateOff($) }
       const five = Number(a)
       const week = Number(b)
       if (!Number.isFinite(five) || !Number.isFinite(week)) return { text: 'Use: /quota simulate <5-hour %> <week %>, or /quota simulate off' }
@@ -396,31 +473,40 @@ export const register: Register = (on, options) => {
       return { text: `SIMULATED: 5-hour ${five}%, weekly ${week}%. Thresholds fire from these numbers.` }
     }
 
-    if (verb === 'model') {
-      if (a === 'off') {
-        await update($, overrides, prev => ({ ...prev, weekModelPercent: null }))
-        return { text: 'Per-model weekly reading cleared.' }
-      }
-      const pct = Number(a)
-      if (!Number.isFinite(pct) || pct < 0 || pct > 100) return { text: 'Use: /quota model <percent>, or /quota model off' }
-      await update($, overrides, prev => ({ ...prev, weekModelPercent: pct }))
-      await update($, quota, prev => ({ ...prev, needsRefresh: true }))
-      return { text: `Per-model weekly set to ${pct}% by hand.` }
-    }
+    if (verb === 'model') return { text: await setModelPercent($, a) }
 
     return { text: 'Quota commands: show · pause until HH:MM · continue · threshold · simulate · model' }
   })
 
+  // The pane draws the readings and the controls, so every command works from a press on any
+  // surface (the desktop app included), with no /quota typed.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Text, Button, Input } = $.ui.resolve(e)
     const lines = await rows($, opts)
+    const p = await read($, pause)
+    const ov = await read($, overrides)
+    const note = await read($, said)
+    const act = (work: () => Promise<string>) => {
+      void work().then(
+        text => update($, said, () => text),
+        err => update($, said, () => `Failed: ${(err as Error).message}`),
+      )
+    }
     return (
       <Box flexDirection="column">
         {lines.map((line, i) => (
-          <Text key={i} dimColor={line.startsWith('  ') || line.startsWith('Overage')}>
+          <Text key={String(i)} dimColor={line.startsWith('  ') || line.startsWith('Overage')}>
             {line}
           </Text>
         ))}
+        <Box flexDirection="row" marginTop={1}>
+          <Button key="refresh" label="Refresh" onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
+          {p.kind !== 'none' ? <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} /> : null}
+          {ov.simulate ? <Button key="sim-off" label="End simulation" onPress={() => act(() => simulateOff($))} /> : null}
+        </Box>
+        <Input key="pause-until" label="Pause until" placeholder="HH:MM" submitLabel="pause" onSubmit={value => act(() => pauseUntil($, value))} />
+        <Input key="model-week" label="Main model weekly %" placeholder="from the usage card, or off" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
+        {note ? <Text dimColor>{note}</Text> : null}
       </Box>
     )
   })
