@@ -129,6 +129,37 @@ export function cachePingDue(writtenAt: number, lastPingAt: number, now: number,
   return now - writtenAt >= everyMs && now - lastPingAt >= PING_RETRY
 }
 
+// The cache lives an hour; a ping lands at least this long before it would expire.
+export const CACHE_TTL = HOUR
+export const PING_MARGIN = 10 * MINUTE
+
+// The keep-alive plan for one cache: from its last write to the reset, the fewest equal gaps of
+// at most CACHE_TTL - PING_MARGIN (50 minutes), so the cache is still warm when the pause ends.
+// `next` is when the next ping is due, `left` how many pings remain before the reset.
+// Null when the reset comes before the cache needs one. With no reset time, one gap at a time.
+export type PingPlan = { next: number; gap: number; left: number | null }
+
+export function pingPlan(writtenAt: number, until: number | null, ttl = CACHE_TTL, margin = PING_MARGIN): PingPlan | null {
+  const maxGap = ttl - margin
+  if (until === null) return { next: writtenAt + maxGap, gap: maxGap, left: null }
+  const span = until - writtenAt
+  if (span <= maxGap) return null
+  const parts = Math.ceil(span / maxGap)
+  const gap = span / parts
+  return { next: writtenAt + gap, gap, left: parts - 1 }
+}
+
+// Is a planned ping due now: its time came, and no ping went out in the last PING_RETRY
+// (one in flight, or one that did not land, is tried again then).
+export function planDue(plan: PingPlan | null, lastPingAt: number, now: number): boolean {
+  return plan !== null && now >= plan.next && now - lastPingAt >= PING_RETRY
+}
+
+// A limit at 100% rejects every request, pings included: the keep-alive stands down.
+export function limitSpent(percents: readonly (number | null)[]): boolean {
+  return percents.some(p => p !== null && p >= 100)
+}
+
 // Pings stop paying past this: a ping reads the whole context at the cache-read price,
 // one every 45 minutes over 12 hours costs about what rebuilding the cache once does.
 export const KEEPALIVE_HORIZON = 12 * HOUR

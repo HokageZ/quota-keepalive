@@ -1,6 +1,6 @@
 {
   "name": "quota-keepalive",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Watches the plan's 5-hour and weekly limits beside the chat, warns at set thresholds, and keeps the main session's and paused subagents' prompt caches warm until the reset.",
   "types": "./types/index.d.ts",
   "userConfig": {
@@ -27,12 +27,6 @@
       "default": 99,
       "title": "Weekly stop percent",
       "description": "Stop and tell the person at this percent of a weekly limit"
-    },
-    "pingMinutes": {
-      "type": "number",
-      "default": 45,
-      "title": "Ping interval (minutes)",
-      "description": "Keep-alive ping interval in minutes (kept under 55)"
     }
   }
 }
