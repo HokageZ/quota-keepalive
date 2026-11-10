@@ -22,7 +22,7 @@ The pane follows the cache-countdown mod: rounded cards, a ring and a bar in gre
 A one-line band above the prompt box, in the cache-countdown style:
 - the prompt cache: a ring, time left of its 60 minutes (or Expired), and how many tokens the next message would re-cache;
 - the live warning from your thresholds (heads-up, subagents stop, stop), in amber or red;
-- while work is paused or kept warm: until when, and the ping plan (`3 pings 45m apart · next 12m`);
+- while work is paused or kept warm: until when and the ping plan (`Paused until 23:53 · 3 pings · next 12m`), with the re-cache stat and "of 60 min" left out so the row fits;
 - **Settings**, which opens the panel with its settings.
 
 It stacks with any other band, such as cache-countdown's; turn that mod off if one cache line is enough.

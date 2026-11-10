@@ -1103,8 +1103,8 @@ export const register: Register = (on, options) => {
     const holdText = !tgt
       ? null
       : p.kind !== 'none'
-        ? `Work paused${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
-        : `Keeping warm${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
+        ? `Paused${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
+        : `Warm${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
     const planText = !tgt
       ? null
       : farOff
@@ -1113,7 +1113,7 @@ export const register: Register = (on, options) => {
           ? 'no pings: limit at 100%'
           : plan === null
             ? 'no ping needed'
-            : `${plan.left === null ? 'a ping' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} ${Math.round(plan.gap / MINUTE)}m apart · next ${fmtDur(Math.max(0, plan.next - now))}`
+            : `${plan.left === null ? 'pinging' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} · next ${fmtDur(Math.max(0, plan.next - now))}`
 
     const openPanel = async () => {
       await update($, settingsOpen, () => true)
@@ -1181,7 +1181,7 @@ export const register: Register = (on, options) => {
                 <Text color={v.tone} bold>
                   {minutes(v.ms)} left
                 </Text>
-                <Text dimColor>of {v.ttl === '1h' ? '60 min' : '5 min'}</Text>
+                {holdText ? null : <Text dimColor>of {v.ttl === '1h' ? '60 min' : '5 min'}</Text>}
               </Box>
             ) : (
               <Text color={v.tone} bold>
@@ -1190,8 +1190,8 @@ export const register: Register = (on, options) => {
             )}
           </Box>
           {v.isWarm ? (
-            <Box gap={3} alignItems="center" flexShrink={0}>
-              {isNarrow ? null : stat(v.recache, 'to re-cache')}
+            <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap" justifyContent="flex-end">
+              {isNarrow || holdText ? null : stat(v.recache, 'to re-cache')}
               {extras()}
             </Box>
           ) : (
@@ -1257,8 +1257,8 @@ export const register: Register = (on, options) => {
                 <Text dimColor>left</Text>
               </Box>
             </Box>
-            <Box gap={2} flexShrink={0}>
-              {isNarrow ? null : stat('re-cache', v.recache)}
+            <Box gap={2} flexShrink={1} flexWrap="wrap">
+              {isNarrow || holdText ? null : stat('re-cache', v.recache)}
               {extras()}
             </Box>
           </Box>
