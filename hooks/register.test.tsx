@@ -190,3 +190,81 @@ test('a 3-hour pause plans 3 pings, 45 minutes apart', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /^pings before reset$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
+
+// A reply that read the cache, as the engine would stream it: the mod records the cache write.
+async function reply($: Parameters<Parameters<typeof test>[1]>[0], on: Parameters<Parameters<typeof test>[1]>[1]) {
+  const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-opus-5-5', messageCount: 2 })
+  for await (const _ of stream) {
+    // chunks are not needed here
+  }
+  return stream.result
+}
+
+function engineStep(on: Parameters<Parameters<typeof test>[1]>[1]) {
+  on('turn.step', async function* () {
+    return {
+      turnId: 't1',
+      index: 0,
+      answer: 'done',
+      toolUses: [],
+      stopReason: 'end_turn',
+      usage: { model: 'claude-opus-5-5', input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 50_000, cache_creation_input_tokens: 0 },
+    } as never
+  })
+}
+
+test('stay warm, turned on in the panel: an idle session gets a ping each interval, and stops after the time picked', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  const pings = engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.settle()
+  await ui.press({ key: 'warm-on' })
+  await clock.settle()
+  await ui.press({ key: 'warm-every-30' })
+  await clock.settle()
+  await ui.press({ key: 'warm-for-1' })
+  await clock.settle()
+
+  // The person asks something; the reply writes the cache.
+  await $.prompt.submit({ text: 'hello', wait: false } as never)
+  await reply($, on)
+  const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
+  const before = keepAlive()
+
+  await clock.advance(29 * MINUTE)
+  expect(keepAlive() - before).toBe(0)
+  await clock.advance(2 * MINUTE)
+  expect(keepAlive() - before).toBe(1)
+  // The ping's reply writes the cache again: the next one is 30 minutes after it, which is past
+  // the one hour picked, so no more pings.
+  await reply($, on)
+  await clock.advance(45 * MINUTE)
+  expect(keepAlive() - before).toBe(1)
+  expect((await ui.find({ type: 'Text', text: /^done: 1h since your last prompt$/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('stay warm rests at the heads-up level', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  const pings = engine(on, { five: 91, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.settle()
+  await ui.press({ key: 'warm-on' })
+  await clock.settle()
+  await $.prompt.submit({ text: 'hello', wait: false } as never)
+  await reply($, on)
+  // Past the 45-minute default interval: an idle session at 91% still gets no ping.
+  await clock.advance(50 * MINUTE)
+  expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
+  expect((await ui.find({ type: 'Text', text: /usage passed the heads-up level/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})

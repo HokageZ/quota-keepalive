@@ -36,9 +36,17 @@ The typed forms still work where slash commands run, for values the chips do not
 
 Each threshold is said once per window reset.
 
-## Keep-alive
+## Two keep-alives
 
-Automatic; there is nothing to set. When a pause starts (a stop level, or **Pause for** in the panel), the mod plans the pings from the time to the reset: the span from each cache's last write to the reset is split into the fewest equal gaps of at most 50 minutes (the 60-minute cache less a 10-minute margin). Three hours to the reset gives 3 pings, 45 minutes apart, and the cache is 45 minutes old when work resumes. A wait shorter than 50 minutes needs no ping. With no reset time known, it pings every 50 minutes.
+The mod keeps the prompt cache warm in two separate ways, each named in the panel.
+
+### Stay warm (everyday, off by default)
+
+For normal use while quota is low: when the session sits idle, a ping every 15, 30, 45 or 55 minutes keeps its cache warm for when you come back, for up to 1, 2, 4 or 8 hours after your last prompt. All of it is picked in Settings. It rests at the heads-up level, during a pause (the reset bridge takes over), while a turn runs, and before the first reply. The time limit counts from your last prompt, never from a ping, so it always ends. Each ping spends a little quota, which is why it starts off.
+
+### Reset bridge (automatic)
+
+Nothing to set. When a pause starts (a stop level, or **Pause for** in the panel), the mod plans the pings from the time to the reset: the span from each cache's last write to the reset is split into the fewest equal gaps of at most 50 minutes (the 60-minute cache less a 10-minute margin). Three hours to the reset gives 3 pings, 45 minutes apart, and the cache is 45 minutes old when work resumes. A wait shorter than 50 minutes needs no ping. With no reset time known, it pings every 50 minutes.
 
 The main session gets a short prompt and each paused subagent a message; each cache keeps its own plan. A ping that does not refresh the cache is tried again 5 minutes later. A ping does nothing but keep the cache warm.
 
