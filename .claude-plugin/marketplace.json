@@ -1,0 +1,5 @@
+{
+  "name": "quota-keepalive",
+  "owner": { "name": "HokageZ" },
+  "plugins": [{ "name": "quota-keepalive", "source": "./" }]
+}
