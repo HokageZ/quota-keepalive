@@ -18,10 +18,11 @@ const PANE = {
 } as const
 
 // The engine beneath the mod: plan readings, prompts it submits, agents, commands.
-function engine(on: Parameters<Parameters<typeof test>[1]>[1], readings: { five: number; week: number; weekResetsIn: number }, now: () => number) {
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], readings: { five: number; week: number; weekResetsIn: number }, now: () => number, withStore = true) {
   const pings: string[] = []
   const start = now()
   on('ui.toast', () => ({ value: undefined }))
+  if (withStore) mock.store(on)
   on('command.register', () => ({ value: { command: 'quota' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -103,5 +104,44 @@ test('a weekly quota pause days from its reset sends no keep-alive pings', async
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /^Paused for Weekly/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
+
+test('settings live in the panel and are saved for the next session', async ($, on) => {
+  const saved: unknown[] = []
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', (_, e) => {
+    saved.push(e)
+    return { value: undefined }
+  })
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now, false)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 't-mainStop' })).toBeFalsy()
+    await ui.press({ key: 'settings' })
+    await clock.settle()
+    expect(await ui.find({ key: 't-mainStop' })).toBeTruthy()
+    expect(await ui.find({ key: 'ping-minutes' })).toBeTruthy()
+    expect(await ui.find({ key: 'simulate' })).toBeTruthy()
+    await ui.press({ key: 'settings' })
+    await clock.settle()
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'settings' })
+  await clock.settle()
+  await ui.input({ key: 't-mainStop', text: '95' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Text', text: /Main stop set to 95%/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /main stops 95%/ }))?.text).toBeTruthy()
+  await ui.input({ key: 'ping-minutes', text: '90' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Text', text: /from 1 to 55/ }))?.text).toBeTruthy()
+  expect(JSON.stringify(saved.at(-1))).toContain('"mainStop":95')
   await ui.unmount()
 })

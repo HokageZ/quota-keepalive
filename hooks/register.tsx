@@ -38,6 +38,7 @@ const NO_PAUSE: PauseState = { kind: 'none', until: null, window: '', startedAt:
 const pause = atom({ plugin: 'quota-keepalive', key: 'pause' } as const, NO_PAUSE, { shape: SHAPE })
 const main = atom({ plugin: 'quota-keepalive', key: 'main' } as const, { model: '', lastTurnAt: 0, lastCacheAt: 0 } as MainState, { shape: SHAPE })
 const said = atom({ plugin: 'quota-keepalive', key: 'said' } as const, '' as string, { shape: SHAPE })
+const settingsOpen = atom({ plugin: 'quota-keepalive', key: 'settingsOpen' } as const, false as boolean, { shape: SHAPE })
 const agents = atom({ plugin: 'quota-keepalive', key: 'agents' } as const, {} as Record<string, AgentState>, { shape: SHAPE })
 
 type Options = Record<string, unknown>
@@ -374,6 +375,80 @@ async function simulateOff($: EngineInterface): Promise<string> {
   return 'Simulation off: live values again.'
 }
 
+// Settings the person changes in the panel; kept in $.store so they outlast the session.
+const STORE_KEY = 'settings'
+type Saved = { thresholds: Partial<Thresholds>; pingMinutes: number | null }
+
+async function saveSettings($: EngineInterface): Promise<void> {
+  const ov = await read($, overrides)
+  const saved: Saved = { thresholds: ov.thresholds, pingMinutes: ov.pingMinutes }
+  try {
+    await $.store.set(STORE_KEY, saved)
+  } catch (err) {
+    $.ui.log(`quota: settings not saved: ${(err as Error).message}`)
+  }
+}
+
+async function loadSettings($: EngineInterface): Promise<void> {
+  let raw: Partial<Saved> | undefined | null
+  try {
+    raw = (await $.store.get(STORE_KEY)) as Partial<Saved> | undefined | null
+  } catch (err) {
+    // A store that cannot be read leaves the defaults; the mod still starts.
+    $.ui.log(`quota: saved settings not read: ${(err as Error).message}`)
+    return
+  }
+  if (!raw || typeof raw !== 'object') return
+  const thresholds: Partial<Thresholds> = {}
+  for (const k of ['headsUp', 'subagentsStop', 'mainStop', 'weekStop'] as const) {
+    const v = raw.thresholds?.[k]
+    if (typeof v === 'number' && v >= 1 && v <= 100) thresholds[k] = v
+  }
+  const ping = typeof raw.pingMinutes === 'number' && raw.pingMinutes >= 1 && raw.pingMinutes <= 55 ? raw.pingMinutes : null
+  await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: ping }))
+}
+
+const THRESHOLD_NAMES: Record<keyof Thresholds, string> = {
+  headsUp: 'Heads-up',
+  subagentsStop: 'Subagents stop',
+  mainStop: 'Main stop',
+  weekStop: 'Weekly stop',
+}
+
+async function setThreshold($: EngineInterface, key: keyof Thresholds, raw: string): Promise<string> {
+  const pct = Number(raw.replace('%', '').trim())
+  if (raw.trim() === '' || !Number.isFinite(pct) || pct < 1 || pct > 100) return 'Use a percent from 1 to 100.'
+  await update($, overrides, prev => ({ ...prev, thresholds: { ...prev.thresholds, [key]: pct } }))
+  await update($, quota, prev => ({ ...prev, said: [] }))
+  await saveSettings($)
+  return `${THRESHOLD_NAMES[key]} set to ${pct}%.`
+}
+
+async function setPingMinutes($: EngineInterface, raw: string): Promise<string> {
+  const m = Number(raw.trim())
+  if (raw.trim() === '' || !Number.isFinite(m) || m < 1 || m > 55) return 'Use minutes from 1 to 55 (the cache lasts 60).'
+  await update($, overrides, prev => ({ ...prev, pingMinutes: m }))
+  await saveSettings($)
+  return `Keep-alive pings every ${m} minutes.`
+}
+
+async function resetSettings($: EngineInterface): Promise<string> {
+  await update($, overrides, prev => ({ ...prev, thresholds: {}, pingMinutes: null }))
+  await update($, quota, prev => ({ ...prev, said: [] }))
+  await saveSettings($)
+  return 'Settings back to the defaults.'
+}
+
+async function simulate($: EngineInterface, raw: string): Promise<string> {
+  const [a = '', b = ''] = raw.trim().split(/[\s,]+/)
+  const five = Number(a.replace('%', ''))
+  const week = Number(b.replace('%', ''))
+  if (!a || !b || !Number.isFinite(five) || !Number.isFinite(week)) return 'Type two percents: 5-hour then weekly, like 97 40.'
+  await update($, overrides, prev => ({ ...prev, simulate: { fiveHour: five, week } }))
+  await update($, quota, prev => ({ ...prev, needsRefresh: true, said: [] }))
+  return `Simulating 5-hour ${five}%, weekly ${week}%. Thresholds fire from these.`
+}
+
 function paceWords(hoursToFull: number | null, lastsToReset: boolean | null): string {
   if (hoursToFull === null) return 'not enough readings yet'
   if (lastsToReset === null) return `runs out in ${fmtDur(hoursToFull * HOUR)} at this pace`
@@ -387,9 +462,9 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     await $.command.register({
       name: 'quota',
-      description:
-        'Quota mod: /quota shows the plan limits; `/quota pause until HH:MM` keeps the cache alive until then; `/quota continue`; `/quota threshold <heads-up|subagents|main|week> <percent>`; `/quota simulate <5h%> <week%>` or `off` (test mode); `/quota model <percent>` or `off`',
+      description: 'Quota mod: opens the Quota panel, where every control and setting lives. Typed forms still work: pause until HH:MM, continue, threshold, simulate, model',
     })
+    await loadSettings($)
     void $.ui.open({ id: PANE, title: 'Quota' })
     await tick($, opts)
     $.clock.every(MINUTE, () => {
@@ -441,9 +516,14 @@ export const register: Register = (on, options) => {
     const [verb = '', a = '', b = ''] = (e.args ?? '').trim().split(/\s+/)
     const now = await $.clock.now()
 
-    if (verb === '' || verb === 'show') {
+    // Bare /quota opens the panel; `/quota show` still prints the readings as text.
+    if (verb === '') {
       await refresh($)
-      void $.ui.open({ id: PANE, title: 'Quota' })
+      await $.ui.open({ id: PANE, title: 'Quota' })
+      return { text: 'Quota panel open: controls and Settings are in it.' }
+    }
+    if (verb === 'show') {
+      await refresh($)
       return { text: (await rows($, opts)).join('\n') }
     }
 
@@ -457,22 +537,15 @@ export const register: Register = (on, options) => {
     if (verb === 'threshold') {
       const names: Record<string, keyof Thresholds> = { 'heads-up': 'headsUp', subagents: 'subagentsStop', main: 'mainStop', week: 'weekStop' }
       const key = names[a]
-      const pct = Number(b)
-      if (!key || !Number.isFinite(pct) || pct < 1 || pct > 100) return { text: 'Use: /quota threshold <heads-up|subagents|main|week> <1-100>' }
-      await update($, overrides, prev => ({ ...prev, thresholds: { ...prev.thresholds, [key]: pct } }))
-      await update($, quota, prev => ({ ...prev, said: [] }))
-      return { text: `Threshold ${a} set to ${pct}%.` }
+      if (!key) return { text: 'Use: /quota threshold <heads-up|subagents|main|week> <1-100>' }
+      return { text: await setThreshold($, key, b) }
     }
 
     if (verb === 'simulate') {
       if (a === 'off') return { text: await simulateOff($) }
-      const five = Number(a)
-      const week = Number(b)
-      if (!Number.isFinite(five) || !Number.isFinite(week)) return { text: 'Use: /quota simulate <5-hour %> <week %>, or /quota simulate off' }
-      await update($, overrides, prev => ({ ...prev, simulate: { fiveHour: five, week } }))
-      await update($, quota, prev => ({ ...prev, needsRefresh: true, said: [] }))
+      const text = await simulate($, `${a} ${b}`)
       await tick($, opts)
-      return { text: `SIMULATED: 5-hour ${five}%, weekly ${week}%. Thresholds fire from these numbers.` }
+      return { text }
     }
 
     if (verb === 'model') return { text: await setModelPercent($, a) }
@@ -737,11 +810,57 @@ export const register: Register = (on, options) => {
         ),
       )
 
+    // Settings: every option and test mode, so nothing needs a typed command.
+    const isOpen = await read($, settingsOpen)
+    if (isOpen) {
+      const field = (key: keyof Thresholds) => (
+        <Input
+          key={`t-${key}`}
+          label={`${THRESHOLD_NAMES[key]} %`}
+          placeholder={String(t[key])}
+          submitLabel="set"
+          onSubmit={value => act(() => setThreshold($, key, value))}
+        />
+      )
+      parts.push(
+        card(
+          'settings',
+          null,
+          <>
+            <Box justifyContent="space-between" alignItems="center">
+              <Text bold>Settings</Text>
+              <Button key="settings-close" role="dismiss" label="Close" onPress={() => void update($, settingsOpen, () => false)} />
+            </Box>
+            <Text dimColor>Alerts and stops, as a percent of each limit. Saved for every session.</Text>
+            {field('headsUp')}
+            {field('subagentsStop')}
+            {field('mainStop')}
+            {field('weekStop')}
+            <Box marginTop={isRich ? 1 : 0} flexDirection="column">
+              <Text dimColor>Keep-alive: ping a paused session once its cache is this old.</Text>
+              <Input key="ping-minutes" label="Ping every (min)" placeholder={String(Math.round(every / MINUTE))} submitLabel="set" onSubmit={value => act(() => setPingMinutes($, value))} />
+            </Box>
+            <Box marginTop={isRich ? 1 : 0} flexDirection="column">
+              <Text dimColor>Test mode: made-up readings, so you can watch alerts and pauses fire.</Text>
+              <Box gap={1} alignItems="center" flexWrap="wrap">
+                <Input key="simulate" label="Simulate" placeholder="5-hour % then weekly %, e.g. 97 40" submitLabel="run" onSubmit={value => act(async () => { const text = await simulate($, value); await tick($, opts); return text })} />
+                {ov.simulate ? <Button key="sim-end" label="End test" onPress={() => act(() => simulateOff($))} /> : null}
+              </Box>
+            </Box>
+            <Box marginTop={isRich ? 1 : 0}>
+              <Button key="settings-reset" label="Reset to defaults" onPress={() => act(() => resetSettings($))} />
+            </Box>
+          </>,
+        ),
+      )
+    }
+
     // Footer: refresh, context, the thresholds, the one thing a mod cannot see.
     parts.push(
       <Box key="footer" flexDirection="column">
         <Box gap={isRich ? 3 : 2} alignItems="center" flexWrap="wrap">
           <Button key="refresh" label="Refresh" onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
+          <Button key="settings" label={isOpen ? 'Hide settings' : 'Settings'} onPress={() => void update($, settingsOpen, v => !v)} />
           {l && l.contextPercent !== null ? stat(`${l.contextPercent}%`, 'context') : null}
           {stat(q.refreshedAt ? `${fmtDur(now - q.refreshedAt)} ago` : 'never', 'read')}
         </Box>

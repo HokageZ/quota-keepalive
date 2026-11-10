@@ -78,6 +78,7 @@ declare module 'claude-code' {
       main: Shaped<MainState>
       agents: Shaped<Record<string, AgentState>>
       said: Shaped<string>
+      settingsOpen: Shaped<boolean>
     }
   }
 }
