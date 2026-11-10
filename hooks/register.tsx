@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { AgentState, MainState, Overrides, PauseState, QuotaLimits, QuotaState, QuotaWindow } from '../types'
 import {
@@ -19,6 +19,8 @@ import {
   windowsOf,
 } from './logic'
 import type { Alert, Sample, Thresholds } from './logic'
+import { barSvg, blocks, cacheTone, pct, ringSvg, toneOf } from './view'
+import type { Tone } from './view'
 
 const PANE = 'quota'
 const SHAPE = 'quota-1'
@@ -478,36 +480,279 @@ export const register: Register = (on, options) => {
     return { text: 'Quota commands: show · pause until HH:MM · continue · threshold · simulate · model' }
   })
 
-  // The pane draws the readings and the controls, so every command works from a press on any
-  // surface (the desktop app included), with no /quota typed.
+  // The pane: one card per limit, then the cache and pause card, subagents, and a footer.
+  // Desktop and phone draw rings and bars as SVG; the terminal draws block characters.
+  // Every command works from the pane's own controls, with no /quota typed.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Input } = $.ui.resolve(e)
-    const lines = await rows($, opts)
-    const p = await read($, pause)
+    const isRich = e.surface !== 'terminal' && e.surface !== 'vscode'
+    const Svg = isRich ? $.ui.resolve(e).Svg : null
+    const cols = e.props.bodyColumns
+
+    const now = await $.clock.now()
+    const q = await read($, quota)
     const ov = await read($, overrides)
+    const p = await read($, pause)
+    const m = await read($, main)
+    const map = await read($, agents)
     const note = await read($, said)
+    const t = thresholdsOf(opts, ov)
+    const every = pingMs(opts, ov)
+
     const act = (work: () => Promise<string>) => {
       void work().then(
         text => update($, said, () => text),
         err => update($, said, () => `Failed: ${(err as Error).message}`),
       )
     }
-    return (
-      <Box flexDirection="column">
-        {lines.map((line, i) => (
-          <Text key={String(i)} dimColor={line.startsWith('  ') || line.startsWith('Overage')}>
-            {line}
+
+    const stat = (value: string, label: string, tone?: Tone) =>
+      isRich ? (
+        <Box key={label} gap={1} alignItems="center">
+          <Text bold color={tone}>
+            {value}
           </Text>
-        ))}
-        <Box flexDirection="row" marginTop={1}>
-          <Button key="refresh" label="Refresh" onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
-          {p.kind !== 'none' ? <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} /> : null}
-          {ov.simulate ? <Button key="sim-off" label="End simulation" onPress={() => act(() => simulateOff($))} /> : null}
+          <Text dimColor>{label}</Text>
         </Box>
-        <Input key="pause-until" label="Pause until" placeholder="HH:MM" submitLabel="pause" onSubmit={value => act(() => pauseUntil($, value))} />
-        <Input key="model-week" label="Main model weekly %" placeholder="from the usage card, or off" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
-        {note ? <Text dimColor>{note}</Text> : null}
+      ) : (
+        <Box key={label} gap={1}>
+          <Text dimColor>{label}</Text>
+          <Text bold color={tone}>
+            {value}
+          </Text>
+        </Box>
+      )
+
+    const ring = (share: number, tone: Tone, alt: string) =>
+      Svg ? <Svg source={ringSvg(share, tone)} alt={alt} width={18} height={18} /> : <Text color={tone}>{share > 0 ? '●' : '○'}</Text>
+
+    // A usage bar: SVG with threshold marks on desktop, blocks sized to the pane in the terminal.
+    const bar = (percent: number, tone: Tone, marks: number[], alt: string) => {
+      if (Svg) return <Svg source={barSvg(percent, tone, marks)} alt={alt} />
+      const b = blocks(percent / 100, Math.max(10, Math.min(40, cols - 16)))
+      return (
+        <Text>
+          <Text color={tone}>{b.filled}</Text>
+          <Text dimColor>{b.empty}</Text>
+        </Text>
+      )
+    }
+
+    const card = (key: string, tone: Tone | null, children: RenderChildren) => (
+      <Box key={key} flexDirection="column" borderStyle="round" borderDimColor={tone === null || tone === 'success'} borderColor={tone && tone !== 'success' ? tone : undefined} paddingX={1} marginBottom={1}>
+        {children}
       </Box>
     )
+
+    // One limit: name and percent, the bar, then reset, pace and outlook.
+    const windowCard = (key: 'fiveHour' | 'weekAll', win: QuotaWindow, stopAt: number) => {
+      const tone = toneOf(win.percent, t.headsUp, stopAt)
+      const pace = paceOf(q.samples, key, now)
+      const o = outlookOf(win, pace, now)
+      const marks = key === 'fiveHour' ? [t.headsUp, t.subagentsStop, t.mainStop] : [t.headsUp, t.weekStop]
+      const outlook =
+        o.hoursToFull === null ? 'pace needs more readings' : o.lastsToReset ? 'lasts to the reset' : `runs out in ${fmtDur(o.hoursToFull * HOUR)}`
+      return card(
+        key,
+        tone,
+        <>
+          <Box justifyContent="space-between" alignItems="center" gap={2}>
+            <Box gap={1} alignItems="center" flexShrink={1}>
+              {ring(win.percent / 100, tone, `${win.label}: ${pct(win.percent)} used`)}
+              <Text bold>{win.label}</Text>
+            </Box>
+            <Box gap={1} alignItems="center" flexShrink={0}>
+              <Text bold color={tone}>
+                {pct(win.percent)}
+              </Text>
+              <Text dimColor>used</Text>
+            </Box>
+          </Box>
+          <Box marginY={isRich ? 1 : 0}>{bar(win.percent, tone, marks, `${pct(win.percent)} of ${win.label}`)}</Box>
+          <Box gap={isRich ? 3 : 2} flexWrap="wrap">
+            {stat(win.resetsAt ? fmtDur(win.resetsAt - now) : '?', 'to reset')}
+            {stat(pace === null ? '…' : `${pace.toFixed(key === 'fiveHour' ? 1 : 2)}%/h`, 'pace')}
+            <Text dimColor color={o.lastsToReset === false ? 'warning' : undefined}>
+              {outlook}
+            </Text>
+          </Box>
+        </>,
+      )
+    }
+
+    const l = q.limits
+    const parts: RenderChildren[] = []
+
+    if (ov.simulate)
+      parts.push(
+        <Box key="sim" gap={1} alignItems="center" marginBottom={1}>
+          <Text bold color="warning">
+            Simulated
+          </Text>
+          <Text dimColor>test values, thresholds fire from them</Text>
+          <Button key="sim-off" label="End" onPress={() => act(() => simulateOff($))} />
+        </Box>,
+      )
+    if (q.unavailable)
+      parts.push(
+        <Text key="unavailable" color="error">
+          {q.unavailable}
+        </Text>,
+      )
+
+    if (!l) parts.push(<Text key="reading" dimColor>Reading the limits…</Text>)
+    else {
+      if (l.fiveHour) parts.push(windowCard('fiveHour', l.fiveHour, t.mainStop))
+      if (l.weekAll) parts.push(windowCard('weekAll', l.weekAll, t.weekStop))
+
+      // The main model's weekly window: the mod cannot read it, so it is typed in.
+      const wm = l.weekModel
+      const modelName = m.model || 'main model'
+      if (wm) {
+        const tone = toneOf(wm.percent, t.headsUp, t.weekStop)
+        parts.push(
+          card(
+            'weekModel',
+            tone,
+            <>
+              <Box justifyContent="space-between" alignItems="center" gap={2}>
+                <Box gap={1} alignItems="center" flexShrink={1}>
+                  {ring(wm.percent / 100, tone, `${wm.label}: ${pct(wm.percent)} used`)}
+                  <Text bold>Weekly · {modelName}</Text>
+                </Box>
+                <Box gap={1} alignItems="center" flexShrink={0}>
+                  <Text bold color={tone}>
+                    {pct(wm.percent)}
+                  </Text>
+                  <Text dimColor>set by hand</Text>
+                </Box>
+              </Box>
+              <Box marginY={isRich ? 1 : 0}>{bar(wm.percent, tone, [t.headsUp, t.weekStop], `${pct(wm.percent)} of ${wm.label}`)}</Box>
+              <Input key="model-week" label="Update" placeholder="% from the usage card, or off" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
+            </>,
+          ),
+        )
+      } else {
+        parts.push(
+          card(
+            'weekModel',
+            null,
+            <>
+              <Box gap={1} alignItems="center">
+                {ring(0, 'success', `Weekly ${modelName}: not set`)}
+                <Text bold>Weekly · {modelName}</Text>
+              </Box>
+              <Text dimColor>A mod cannot read this one. Copy it from the usage card.</Text>
+              <Input key="model-week" label="Percent" placeholder="e.g. 42" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
+            </>,
+          ),
+        )
+      }
+    }
+
+    // Cache and pause: how long the main cache has, and what the keep-alive is doing.
+    const ttl = l && windowsOf(l).some(w => w.win.percent >= 100) ? 5 * MINUTE : HOUR
+    const cacheLeft = m.lastCacheAt ? m.lastCacheAt + ttl - now : null
+    const share = cacheLeft === null ? 0 : Math.max(0, cacheLeft / ttl)
+    const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
+    const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
+    const nextPing = p.kind === 'none' ? null : farOff ? null : Math.max(0, cacheWrittenAt(m.lastCacheAt, p.startedAt) + every - now)
+    const pauseText =
+      p.kind === 'none'
+        ? 'Not paused'
+        : p.kind === 'quota'
+          ? `Paused for ${p.window}${p.until ? `, ${fmtDur(p.until - now)} to go` : ''}`
+          : `Paused until ${p.until ? new Date(p.until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?'}`
+
+    parts.push(
+      card(
+        'cache',
+        p.kind === 'none' ? (cacheLeft === null ? null : cTone) : 'warning',
+        <>
+          <Box justifyContent="space-between" alignItems="center" gap={2}>
+            <Box gap={1} alignItems="center" flexShrink={1}>
+              {ring(share, cTone, cacheLeft === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${fmtDur(Math.max(0, cacheLeft))} left`)}
+              <Text bold>Prompt cache</Text>
+            </Box>
+            <Box gap={1} alignItems="center" flexShrink={0}>
+              {cacheLeft === null ? (
+                <Text dimColor>no reply yet</Text>
+              ) : cacheLeft > 0 ? (
+                <>
+                  <Text bold color={cTone}>
+                    {fmtDur(cacheLeft)} left
+                  </Text>
+                  <Text dimColor>of {ttl === HOUR ? '60m' : '5m'}</Text>
+                </>
+              ) : (
+                <Text bold color="error">
+                  Expired
+                </Text>
+              )}
+            </Box>
+          </Box>
+          <Box gap={isRich ? 3 : 2} flexWrap="wrap" marginTop={isRich ? 1 : 0}>
+            <Text bold color={p.kind === 'none' ? undefined : 'warning'}>
+              {pauseText}
+            </Text>
+            {p.kind === 'none'
+              ? stat('off', 'keep-alive')
+              : farOff
+                ? <Text dimColor>no pings: the reset is too far off</Text>
+                : stat(nextPing === null ? '?' : fmtDur(nextPing), 'to next ping', 'warning')}
+          </Box>
+          <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
+            {p.kind !== 'none' ? <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} /> : null}
+            <Input key="pause-until" label={p.kind === 'none' ? 'Pause until' : 'Move to'} placeholder="HH:MM" submitLabel="pause" onSubmit={value => act(() => pauseUntil($, value))} />
+          </Box>
+        </>,
+      ),
+    )
+
+    // Subagents, one row each, only when there are any.
+    const agentList = (await $.agent.list()).slice(0, MAX_ROWS)
+    if (agentList.length > 0)
+      parts.push(
+        card(
+          'agents',
+          null,
+          <>
+            <Text bold>Subagents</Text>
+            {agentList.map(a => {
+              const s = map[a.id]
+              const paused = s?.status === 'paused'
+              const window = s && m.model ? (spendsWindow(s.model, m.model) === 'model' ? 'model window' : 'all-models') : ''
+              return (
+                <Box key={a.id} gap={2} flexWrap="wrap">
+                  <Text color={paused ? 'warning' : undefined}>
+                    {paused ? '❚❚' : a.status === 'running' ? '●' : '○'} {a.description || a.type}
+                  </Text>
+                  <Text dimColor>
+                    {[s?.model ?? '', paused ? 'paused for quota' : a.status, `${s?.tokens ?? 0} tok`, s?.lastCacheAt ? `cache ${fmtDur(now - s.lastCacheAt)} old` : '', window].filter(Boolean).join(' · ')}
+                  </Text>
+                </Box>
+              )
+            })}
+          </>,
+        ),
+      )
+
+    // Footer: refresh, context, the thresholds, the one thing a mod cannot see.
+    parts.push(
+      <Box key="footer" flexDirection="column">
+        <Box gap={isRich ? 3 : 2} alignItems="center" flexWrap="wrap">
+          <Button key="refresh" label="Refresh" onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
+          {l && l.contextPercent !== null ? stat(`${l.contextPercent}%`, 'context') : null}
+          {stat(q.refreshedAt ? `${fmtDur(now - q.refreshedAt)} ago` : 'never', 'read')}
+        </Box>
+        <Text dimColor>
+          Alerts at {t.headsUp}% · subagents stop {t.subagentsStop}% · main stops {t.mainStop}% · weekly stop {t.weekStop}%
+        </Text>
+        <Text dimColor>Extra usage drops the cache to 5 minutes; a mod cannot see it.</Text>
+        {note ? <Text color={note.startsWith('Failed') || note.startsWith('Use') ? 'error' : 'success'}>{note}</Text> : null}
+      </Box>,
+    )
+
+    return <Box flexDirection="column">{parts}</Box>
   })
 }
