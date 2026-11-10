@@ -19,7 +19,7 @@ import {
   windowsOf,
 } from './logic'
 import type { Alert, Sample, Thresholds } from './logic'
-import { barSvg, blocks, cacheTone, pct, ringSvg, toneOf } from './view'
+import { barSvg, blocks, cacheTone, pct, ringSvg, scaleSvg, toneOf } from './view'
 import type { Tone } from './view'
 
 const PANE = 'quota'
@@ -350,6 +350,12 @@ async function pauseUntil($: EngineInterface, hhmm: string): Promise<string> {
   const now = await $.clock.now()
   const at = nextClock(hhmm, now)
   if (at === null) return 'Use a clock time, like 15:45.'
+  return pauseAt($, at)
+}
+
+async function pauseAt($: EngineInterface, at: number): Promise<string> {
+  const now = await $.clock.now()
+  if (at <= now) return 'That time has passed.'
   await update($, pause, () => NO_PAUSE)
   await startPause($, 'time', 'time', now, at)
   await tellMain($, `[quota mod] The person paused you until ${new Date(at).toLocaleTimeString()}. Stop starting work; finish only what is in hand and report. The mod keeps the cache warm and will tell you to continue.`)
@@ -365,12 +371,14 @@ async function continueNow($: EngineInterface): Promise<string> {
 async function setModelPercent($: EngineInterface, raw: string): Promise<string> {
   if (raw.trim() === 'off' || raw.trim() === '') {
     await update($, overrides, prev => ({ ...prev, weekModelPercent: null }))
+    await refresh($)
     return 'Per-model weekly reading cleared.'
   }
   const pct = Number(raw.replace('%', ''))
   if (!Number.isFinite(pct) || pct < 0 || pct > 100) return 'Use a percent from 0 to 100, or off.'
   await update($, overrides, prev => ({ ...prev, weekModelPercent: pct }))
-  await update($, quota, prev => ({ ...prev, needsRefresh: true }))
+  // Read again now so the card shows the picked value at once.
+  await refresh($)
   return `Per-model weekly set to ${pct}% by hand.`
 }
 
@@ -436,6 +444,24 @@ async function setPingMinutes($: EngineInterface, raw: string): Promise<string> 
   await saveSettings($)
   return `Keep-alive pings every ${m} minutes.`
 }
+
+// The chips offered for each setting; the current value is added when it is none of them.
+const CHOICES: Record<keyof Thresholds, number[]> = {
+  headsUp: [75, 80, 85, 90, 95],
+  subagentsStop: [90, 93, 95, 96, 97],
+  mainStop: [95, 96, 97, 98, 99],
+  weekStop: [95, 97, 98, 99, 100],
+}
+const PING_CHOICES = [15, 30, 40, 45, 50, 55]
+const withCurrent = (list: number[], current: number): number[] => (list.includes(current) ? list : [...list, current].sort((a, b) => a - b))
+
+// Test scenarios: made-up readings that each cross one level.
+const SCENARIOS: { key: string; label: string; five: number; week: number }[] = [
+  { key: 'heads-up', label: 'Heads-up', five: 91, week: 40 },
+  { key: 'subagents', label: 'Subagents stop', five: 96.5, week: 40 },
+  { key: 'main', label: 'Main stop', five: 98.5, week: 40 },
+  { key: 'week', label: 'Weekly stop', five: 40, week: 99.5 },
+]
 
 async function resetSettings($: EngineInterface): Promise<string> {
   await update($, overrides, prev => ({ ...prev, thresholds: {}, pingMinutes: null }))
@@ -567,7 +593,7 @@ export const register: Register = (on, options) => {
   // Desktop and phone draw rings and bars as SVG; the terminal draws block characters.
   // Every command works from the pane's own controls, with no /quota typed.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Input } = $.ui.resolve(e)
+    const { Box, Text, Button, Select } = $.ui.resolve(e)
     const isRich = e.surface !== 'terminal' && e.surface !== 'vscode'
     const Svg = isRich ? $.ui.resolve(e).Svg : null
     const cols = e.props.bodyColumns
@@ -620,6 +646,32 @@ export const register: Register = (on, options) => {
         </Text>
       )
     }
+
+    // A row of one-click choices; the current one is drawn as the primary button.
+    const chips = (prefix: string, values: number[], current: number | null, fmt: (v: number) => string, pick: (v: number) => Promise<string>) => (
+      <Box gap={1} flexWrap="wrap" alignItems="center">
+        {values.map(v => (
+          <Button key={`${prefix}-${v}`} label={fmt(v)} variant={v === current ? 'primary' : 'secondary'} onPress={() => act(() => pick(v))} />
+        ))}
+      </Box>
+    )
+
+    const modelPicker = (value: string) => (
+      <Select
+        key="model-week"
+        label="Usage card says"
+        value={value}
+        // A Select holds at most 64 options: every 2%, plus the current value when it is odd.
+        options={[
+          { value: 'off', label: 'not set' },
+          ...withCurrent(
+            Array.from({ length: 51 }, (_, i) => i * 2),
+            value === 'off' ? 0 : Number(value),
+          ).map(i => ({ value: String(i), label: `${i}%` })),
+        ]}
+        onSelect={v => act(() => setModelPercent($, v))}
+      />
+    )
 
     const card = (key: string, tone: Tone | null, children: RenderChildren) => (
       <Box key={key} flexDirection="column" borderStyle="round" borderDimColor={tone === null || tone === 'success'} borderColor={tone && tone !== 'success' ? tone : undefined} paddingX={1} marginBottom={1}>
@@ -711,7 +763,7 @@ export const register: Register = (on, options) => {
                 </Box>
               </Box>
               <Box marginY={isRich ? 1 : 0}>{bar(wm.percent, tone, [t.headsUp, t.weekStop], `${pct(wm.percent)} of ${wm.label}`)}</Box>
-              <Input key="model-week" label="Update" placeholder="% from the usage card, or off" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
+              {modelPicker(String(wm.percent))}
             </>,
           ),
         )
@@ -725,8 +777,8 @@ export const register: Register = (on, options) => {
                 {ring(0, 'success', `Weekly ${modelName}: not set`)}
                 <Text bold>Weekly · {modelName}</Text>
               </Box>
-              <Text dimColor>A mod cannot read this one. Copy it from the usage card.</Text>
-              <Input key="model-week" label="Percent" placeholder="e.g. 42" submitLabel="set" onSubmit={value => act(() => setModelPercent($, value))} />
+              <Text dimColor>A mod cannot read this one. Pick the number the usage card shows.</Text>
+              {modelPicker('off')}
             </>,
           ),
         )
@@ -784,9 +836,19 @@ export const register: Register = (on, options) => {
                 ? <Text dimColor>no pings: the reset is too far off</Text>
                 : stat(nextPing === null ? '?' : fmtDur(nextPing), 'to next ping', 'warning')}
           </Box>
+          {p.kind !== 'none' ? (
+            <Box marginTop={isRich ? 1 : 0}>
+              <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} />
+            </Box>
+          ) : null}
           <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
-            {p.kind !== 'none' ? <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} /> : null}
-            <Input key="pause-until" label={p.kind === 'none' ? 'Pause until' : 'Move to'} placeholder="HH:MM" submitLabel="pause" onSubmit={value => act(() => pauseUntil($, value))} />
+            <Text dimColor>{p.kind === 'none' ? 'Pause for' : 'Move to'}</Text>
+            {[30, 60, 120, 180].map(min => (
+              <Button key={`pause-${min}`} label={min < 60 ? `${min}m` : `${min / 60}h`} onPress={() => act(() => pauseAt($, now + min * MINUTE))} />
+            ))}
+            {l?.fiveHour?.resetsAt && l.fiveHour.resetsAt > now ? (
+              <Button key="pause-reset" label="Until 5-hour reset" onPress={() => act(() => pauseAt($, l.fiveHour!.resetsAt!))} />
+            ) : null}
           </Box>
         </>,
       ),
@@ -820,18 +882,22 @@ export const register: Register = (on, options) => {
         ),
       )
 
-    // Settings: every option and test mode, so nothing needs a typed command.
+    // Settings: every option and test mode as one-click choices; nothing to type.
     const isOpen = await read($, settingsOpen)
     if (isOpen) {
-      const field = (key: keyof Thresholds) => (
-        <Input
-          key={`t-${key}`}
-          label={`${THRESHOLD_NAMES[key]} %`}
-          placeholder={String(t[key])}
-          submitLabel="set"
-          onSubmit={value => act(() => setThreshold($, key, value))}
-        />
+      const row = (key: keyof Thresholds, hint: string) => (
+        <Box key={`row-${key}`} flexDirection="column" marginTop={isRich ? 1 : 0}>
+          <Box gap={1} alignItems="center">
+            <Text bold>{THRESHOLD_NAMES[key]}</Text>
+            <Text bold color={key === 'headsUp' ? 'warning' : 'error'}>
+              {t[key]}%
+            </Text>
+            <Text dimColor>{hint}</Text>
+          </Box>
+          {chips(`t-${key}`, withCurrent(CHOICES[key], t[key]), t[key], v => `${v}%`, v => setThreshold($, key, String(v)))}
+        </Box>
       )
+      const pingNow = Math.round(every / MINUTE)
       parts.push(
         card(
           'settings',
@@ -841,23 +907,50 @@ export const register: Register = (on, options) => {
               <Text bold>Settings</Text>
               <Button key="settings-close" role="dismiss" label="Close" onPress={() => void update($, settingsOpen, () => false)} />
             </Box>
-            <Text dimColor>Alerts and stops, as a percent of each limit. Saved for every session.</Text>
-            {field('headsUp')}
-            {field('subagentsStop')}
-            {field('mainStop')}
-            {field('weekStop')}
-            <Box marginTop={isRich ? 1 : 0} flexDirection="column">
-              <Text dimColor>Keep-alive: ping a paused session once its cache is this old.</Text>
-              <Input key="ping-minutes" label="Ping every (min)" placeholder={String(Math.round(every / MINUTE))} submitLabel="set" onSubmit={value => act(() => setPingMinutes($, value))} />
+            {Svg ? (
+              <Box flexDirection="column" marginTop={1}>
+                <Svg source={scaleSvg(t)} alt={`Levels: heads-up ${t.headsUp}%, subagents stop ${t.subagentsStop}%, main stop ${t.mainStop}%, weekly stop ${t.weekStop}%`} />
+                <Text dimColor>Where each level sits on its limit. Saved for every session.</Text>
+              </Box>
+            ) : (
+              <Text dimColor>Saved for every session.</Text>
+            )}
+            {row('headsUp', 'a toast for any limit')}
+            {row('subagentsStop', 'subagents pause, 5-hour')}
+            {row('mainStop', 'main session pauses, 5-hour')}
+            {row('weekStop', 'everything stops, weekly')}
+            <Box flexDirection="column" marginTop={1}>
+              <Box gap={1} alignItems="center">
+                <Text bold>Keep-alive ping</Text>
+                <Text bold color="success">every {pingNow}m</Text>
+                <Text dimColor>while paused; the cache lasts 60m</Text>
+              </Box>
+              {chips('ping', withCurrent(PING_CHOICES, pingNow), pingNow, v => `${v}m`, v => setPingMinutes($, String(v)))}
             </Box>
-            <Box marginTop={isRich ? 1 : 0} flexDirection="column">
-              <Text dimColor>Test mode: made-up readings, so you can watch alerts and pauses fire.</Text>
-              <Box gap={1} alignItems="center" flexWrap="wrap">
-                <Input key="simulate" label="Simulate" placeholder="5-hour % then weekly %, e.g. 97 40" submitLabel="run" onSubmit={value => act(async () => { const text = await simulate($, value); await tick($, opts); return text })} />
+            <Box flexDirection="column" marginTop={1}>
+              <Box gap={1} alignItems="center">
+                <Text bold>Test mode</Text>
+                {ov.simulate ? (
+                  <Text bold color="warning">
+                    on: 5-hour {ov.simulate.fiveHour}%, weekly {ov.simulate.week}%
+                  </Text>
+                ) : (
+                  <Text dimColor>made-up readings to watch a level fire</Text>
+                )}
+              </Box>
+              <Box gap={1} flexWrap="wrap" alignItems="center">
+                {SCENARIOS.map(sc => (
+                  <Button
+                    key={`sim-${sc.key}`}
+                    label={sc.label}
+                    variant={ov.simulate && ov.simulate.fiveHour === sc.five && ov.simulate.week === sc.week ? 'primary' : 'secondary'}
+                    onPress={() => act(async () => { const text = await simulate($, `${sc.five} ${sc.week}`); await tick($, opts); return text })}
+                  />
+                ))}
                 {ov.simulate ? <Button key="sim-end" label="End test" onPress={() => act(() => simulateOff($))} /> : null}
               </Box>
             </Box>
-            <Box marginTop={isRich ? 1 : 0}>
+            <Box marginTop={1}>
               <Button key="settings-reset" label="Reset to defaults" onPress={() => act(() => resetSettings($))} />
             </Box>
           </>,

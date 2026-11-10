@@ -19,12 +19,13 @@ The pane follows the cache-countdown mod: rounded cards, a ring and a bar in gre
 
 ## Controls in the pane
 
-The panel is the main view: everything is set and run from it, and nothing needs a typed command. `/quota` opens it.
+The panel is the main view: every setting is a click, and nothing needs typing. `/quota` opens it.
 
-- **Refresh**, **Continue now** (while paused), a **Pause until** field (type `15:45`, Enter), and a **Percent** field for the main model's weekly limit (copy it from the usage card, or `off`).
-- **Settings** in the footer opens the settings card: the four alert and stop percents, the keep-alive ping interval, test mode (type `97 40` for a made-up 5-hour and weekly reading, **End test** to stop), and **Reset to defaults**. These are saved and used in every session.
+- **Pause for** 30m, 1h, 2h, 3h, or **Until 5-hour reset**; **Continue now** while paused.
+- The main model's weekly percent is picked from a list (the number on the usage card).
+- **Settings** in the footer: a scale with the 5-hour and weekly levels, then chips for the heads-up, subagents stop, main stop and weekly stop percents and the keep-alive ping interval, test-mode scenarios (Heads-up, Subagents stop, Main stop, Weekly stop, End test), and **Reset to defaults**. Saved for every session.
 
-The typed forms still work where slash commands run: `/quota show` (the readings as text), `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 42` or `off`.
+The typed forms still work where slash commands run, for values the chips do not offer: `/quota show`, `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 43` or `off`.
 
 ## Thresholds
 
