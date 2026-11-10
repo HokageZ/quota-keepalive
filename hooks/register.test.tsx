@@ -44,7 +44,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], readings: { five:
   return pings
 }
 
-test('the pane draws its controls on every surface, and a pause starts from the pane', async ($, on) => {
+test('the pane draws its controls on every surface; keep warm, then pause work until then', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
   engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
   mock.session(on)
@@ -55,22 +55,25 @@ test('the pane draws its controls on every surface, and a pause starts from the 
     expect((await ui.find({ type: 'Text', text: /^5-hour limit$/ }))?.text).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /^20%$/ }))?.text).toBeTruthy()
     expect(await ui.find({ key: 'refresh' })).toBeTruthy()
-    expect(await ui.find({ key: 'pause-60' })).toBeTruthy()
-    expect(await ui.find({ key: 'pause-reset' })).toBeTruthy()
-    expect(await ui.find({ key: 'warm-on' })).toBeTruthy()
+    for (const key of ['keep-off', 'keep-1', 'keep-2', 'keep-4', 'keep-reset']) expect(await ui.find({ key })).toBeTruthy()
+    // Nothing to pause until a keep-warm end is picked.
+    expect(await ui.find({ key: 'pause-work' })).toBeFalsy()
     expect(await ui.find({ key: 'model-week' })).toBeTruthy()
     await ui.unmount()
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'pause-120' })
+  await ui.press({ key: 'keep-2' })
   await clock.settle()
-  expect((await ui.find({ type: 'Text', text: /Paused until/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Keeping warm until/ }))?.text).toBeTruthy()
+  await ui.press({ key: 'pause-work' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Text', text: /^Work paused until/ }))?.text).toBeTruthy()
   expect(await ui.find({ key: 'continue' })).toBeTruthy()
 
   await ui.press({ key: 'continue' })
   await clock.settle()
-  expect((await ui.find({ type: 'Text', text: /^Not paused$/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Not keeping warm$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
 
@@ -103,7 +106,7 @@ test('a weekly quota pause days from its reset sends no keep-alive pings', async
   expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ type: 'Text', text: /^Paused for Weekly/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Work paused by the Weekly/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
 
@@ -125,8 +128,9 @@ test('settings live in the panel and are saved for the next session', async ($, 
     await ui.press({ key: 'settings' })
     await clock.settle()
     expect(await ui.find({ key: 't-mainStop-95' })).toBeTruthy()
-    expect((await ui.find({ type: 'Text', text: /^automatic$/ }))?.text).toBeTruthy()
     expect(await ui.find({ key: 'sim-main' })).toBeTruthy()
+    // The keep-warm rule is explained once, on the page, not in Settings.
+    expect((await ui.find({ type: 'Text', text: /at most 50 minutes apart/ }))?.text).toBeTruthy()
     await ui.press({ key: 'settings' })
     await clock.settle()
     await ui.unmount()
@@ -142,7 +146,7 @@ test('settings live in the panel and are saved for the next session', async ($, 
   // Test mode from a scenario chip: the main stop fires and pauses the session.
   await ui.press({ key: 'sim-main' })
   await clock.settle()
-  expect((await ui.find({ type: 'Text', text: /^Paused for 5-hour limit/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^Work paused by the 5-hour limit/ }))?.text).toBeTruthy()
   // The model's weekly percent is picked, not typed.
   await ui.select({ key: 'model-week', value: '42' })
   await clock.settle()
@@ -179,16 +183,17 @@ test('at 100% of a limit the keep-alive stands down: no pings, and the panel say
   await ui.unmount()
 })
 
-test('a 3-hour pause plans 3 pings, 45 minutes apart', async ($, on) => {
+test('keep warm until a reset 3 hours off plans 3 pings, 45 minutes apart', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
   engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  await ui.press({ key: 'pause-180' })
+  await ui.press({ key: 'keep-reset' })
   await clock.settle()
   expect((await ui.find({ type: 'Text', text: /^45m$/ }))?.text).toBeTruthy()
-  expect((await ui.find({ type: 'Text', text: /^pings before reset$/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^3$/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^pings left$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
 
@@ -214,58 +219,50 @@ function engineStep(on: Parameters<Parameters<typeof test>[1]>[1]) {
   })
 }
 
-test('stay warm, turned on in the panel: an idle session gets a ping each interval, and stops after the time picked', async ($, on) => {
+test('keep warm 2h while idle: pings 40 minutes apart, then it ends by itself', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
   const pings = engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
   engineStep(on)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // Stay warm is on the page: no Settings needed.
-  expect(await ui.find({ key: 't-mainStop-95' })).toBeFalsy()
-  await ui.press({ key: 'warm-on' })
-  await clock.settle()
-  await ui.press({ key: 'warm-every-30' })
-  await clock.settle()
-  await ui.press({ key: 'warm-for-1' })
-  await clock.settle()
 
-  // The person asks something; the reply writes the cache.
-  await $.prompt.submit({ text: 'hello', wait: false } as never)
+  // A reply writes the cache, then the person picks 2 hours and steps away.
   await reply($, on)
+  await ui.press({ key: 'keep-2' })
+  await clock.settle()
   const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
-  const before = keepAlive()
 
-  await clock.advance(29 * MINUTE)
-  expect(keepAlive() - before).toBe(0)
+  // 2 hours in gaps of at most 50 minutes: 3 equal gaps of 40 minutes.
+  await clock.advance(39 * MINUTE)
+  expect(keepAlive()).toBe(0)
   await clock.advance(2 * MINUTE)
-  expect(keepAlive() - before).toBe(1)
-  // The ping's reply writes the cache again: the next one is 30 minutes after it, which is past
-  // the one hour picked, so no more pings.
+  expect(keepAlive()).toBe(1)
+  await reply($, on) // the ping's reply writes the cache
+  await clock.advance(41 * MINUTE)
+  expect(keepAlive()).toBe(2)
   await reply($, on)
-  await clock.advance(45 * MINUTE)
-  expect(keepAlive() - before).toBe(1)
-  expect((await ui.find({ type: 'Text', text: /^done: 1h since your last prompt$/ }))?.text).toBeTruthy()
+  // The rest of the 2 hours is under 50 minutes: no more pings, and it ends at the 2-hour mark.
+  await clock.advance(40 * MINUTE)
+  expect(keepAlive()).toBe(2)
+  expect((await ui.find({ type: 'Text', text: /^Not keeping warm$/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
 
-test('stay warm rests at the heads-up level', async ($, on) => {
+test('your own replies count: one that writes the cache moves the next ping back', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
-  const pings = engine(on, { five: 91, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  const pings = engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
   engineStep(on)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  // Stay warm is on the page: no Settings needed.
-  expect(await ui.find({ key: 't-mainStop-95' })).toBeFalsy()
-  await ui.press({ key: 'warm-on' })
-  await clock.settle()
-  await $.prompt.submit({ text: 'hello', wait: false } as never)
   await reply($, on)
-  // Past the 45-minute default interval: an idle session at 91% still gets no ping.
-  await clock.advance(50 * MINUTE)
+  await ui.press({ key: 'keep-1' })
+  await clock.settle()
+  // 1 hour alone would take a ping at 30 minutes; a reply at 25 minutes leaves 35, under 50.
+  await clock.advance(25 * MINUTE)
+  await reply($, on)
+  await clock.advance(34 * MINUTE)
   expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
-  expect((await ui.find({ type: 'Text', text: /usage passed the heads-up level/ }))?.text).toBeTruthy()
   await ui.unmount()
 })

@@ -19,13 +19,13 @@ The pane follows the cache-countdown mod: rounded cards, a ring and a bar in gre
 
 ## Controls in the pane
 
-The panel is the main view: every setting is a click, and nothing needs typing. `/quota` opens it.
+The panel is the main view: every control is a click, and nothing needs typing. `/quota` opens it.
 
-- **Pause for** 30m, 1h, 2h, 3h, or **Until 5-hour reset**; **Continue now** while paused.
+- The prompt cache card: **Keep warm** Off, 1h, 2h, 4h or **Until reset**, then **Pause work until then** (or **Continue now** while paused).
 - The main model's weekly percent is picked from a list (the number on the usage card).
-- **Settings** in the footer: a scale with the 5-hour and weekly levels, then chips for the heads-up, subagents stop, main stop and weekly stop percents, test-mode scenarios (Heads-up, Subagents stop, Main stop, Weekly stop, End test), and **Reset to defaults**. Saved for every session.
+- **Settings** in the footer: a scale with the 5-hour and weekly levels, chips for the heads-up, subagents stop, main stop and weekly stop percents, test-mode scenarios, and **Reset to defaults**. Saved for every session.
 
-The typed forms still work where slash commands run, for values the chips do not offer: `/quota show`, `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 43` or `off`.
+The typed forms still work where slash commands run: `/quota show`, `/quota pause until 15:45`, `/quota continue`, `/quota threshold main 95`, `/quota simulate 97 40` or `off`, `/quota model 43` or `off`.
 
 ## Thresholds
 
@@ -36,25 +36,15 @@ The typed forms still work where slash commands run, for values the chips do not
 
 Each threshold is said once per window reset.
 
-## Two keep-alives
+## Keep warm
 
-The mod keeps the prompt cache warm in two separate ways, each named in the panel.
+One system, one rule. Pick how long to keep the prompt cache warm (1h, 2h, 4h, or until the 5-hour reset). From the cache's last write to that end, the mod pings at the fewest equal gaps of at most 50 minutes (the 60-minute cache less a 10-minute margin), so the cache is still warm at the end. Two hours gives 2 pings, 40 minutes apart; three hours to the reset gives 3, 45 minutes apart. Your own replies write the cache too, so it only pings while you're away. It ends by itself at the end time.
 
-### Stay warm (everyday, off by default)
+**Pause work until then** also stops Claude and its subagents, and tells them to continue at the end; **Continue now** ends it early. When a limit reaches its stop level, the mod does both by itself: work paused, kept warm until the reset. Paused subagents are kept warm on the same rule.
 
-For normal use while quota is low: when the session sits idle, a ping every 15, 30, 45 or 55 minutes keeps its cache warm for when you come back, for up to 1, 2, 4 or 8 hours after your last prompt. All of it is picked on the panel itself, on the prompt cache card. It rests at the heads-up level, during a pause (the reset bridge takes over), while a turn runs, and before the first reply. The time limit counts from your last prompt, never from a ping, so it always ends. Each ping spends a little quota, which is why it starts off.
+It does not ping while a turn runs (the turn keeps the cache warm), at 100% of a limit (every request is refused), or for a limit's pause more than 12 hours from its reset (a weekly window): there the pings would cost more than rebuilding the cache once. The panel says which. A ping that does not refresh the cache is tried again 5 minutes later. Each ping spends a little quota and shows as a row in the transcript.
 
-### Reset bridge (automatic)
-
-Nothing to set. When a pause starts (a stop level, or **Pause for** in the panel), the mod plans the pings from the time to the reset: the span from each cache's last write to the reset is split into the fewest equal gaps of at most 50 minutes (the 60-minute cache less a 10-minute margin). Three hours to the reset gives 3 pings, 45 minutes apart, and the cache is 45 minutes old when work resumes. A wait shorter than 50 minutes needs no ping. With no reset time known, it pings every 50 minutes.
-
-The main session gets a short prompt and each paused subagent a message; each cache keeps its own plan. A ping that does not refresh the cache is tried again 5 minutes later. A ping does nothing but keep the cache warm.
-
-The keep-alive stands down, and the panel says why:
-- at 100% of a limit, where every request, a ping included, is refused;
-- for a quota pause more than 12 hours from its reset (a weekly window): the pings would spend the quota that ran out and cost more than rebuilding the cache once.
-
-When the window resets, or the time arrives, the main session is told to continue and paused subagents are told to resume. A quota pause also ends when a fresh reading shows the window back under the level that paused it.
+A quota pause also ends when a fresh reading shows the window back under the level that paused it.
 
 ## Commands (optional)
 
