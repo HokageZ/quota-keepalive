@@ -4,7 +4,7 @@ A Claude Code mod that does by itself what was done by hand in long unattended s
 
 ## What it shows
 
-A pane named **Quota** beside the chat, refreshed once a minute, with the readings refreshed every 10 minutes and after each subagent ends:
+A pane named **Quota** beside the chat. It reads the plan limits every 15 seconds and right after each turn (the read is local and costs nothing), so the countdowns and percents stay live without pressing Refresh:
 
 - the 5-hour limit: percent used, time to reset, pace per hour over the last 3 hours, and when it would run out at that pace;
 - the weekly limit for all models, with the same pace figures;
@@ -56,7 +56,7 @@ A ping is a real request, so it spends a little quota, and a ping to the main se
 
 ## Settings
 
-Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `headsUpPercent` (90), `subagentsStopPercent` (96), `mainStopPercent` (98), `weekStopPercent` (99), `pingMinutes` (45), `refreshMinutes` (10).
+Set in `pluginConfigs` under `quota-keepalive` (or in the mod's options): `headsUpPercent` (90), `subagentsStopPercent` (96), `mainStopPercent` (98), `weekStopPercent` (99), `pingMinutes` (45).
 
 ## Limits of what a mod can do
 

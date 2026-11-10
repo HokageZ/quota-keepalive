@@ -1,14 +1,38 @@
 {
   "name": "quota-keepalive",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Watches the plan's 5-hour and weekly limits beside the chat, warns at set thresholds, and keeps the main session's and paused subagents' prompt caches warm until the reset.",
   "types": "./types/index.d.ts",
   "userConfig": {
-    "headsUpPercent": { "type": "number", "default": 90, "title": "Heads-up percent", "description": "Heads-up at this percent of any window" },
-    "subagentsStopPercent": { "type": "number", "default": 96, "title": "Subagents stop percent", "description": "Running subagents stop at this percent of the 5-hour limit" },
-    "mainStopPercent": { "type": "number", "default": 98, "title": "Main stop percent", "description": "Main session stops starting work at this percent of the 5-hour limit" },
-    "weekStopPercent": { "type": "number", "default": 99, "title": "Weekly stop percent", "description": "Stop and tell the person at this percent of a weekly limit" },
-    "pingMinutes": { "type": "number", "default": 45, "title": "Ping interval (minutes)", "description": "Keep-alive ping interval in minutes (kept under 55)" },
-    "refreshMinutes": { "type": "number", "default": 10, "title": "Refresh interval (minutes)", "description": "Refresh the plan limits every this many minutes" }
+    "headsUpPercent": {
+      "type": "number",
+      "default": 90,
+      "title": "Heads-up percent",
+      "description": "Heads-up at this percent of any window"
+    },
+    "subagentsStopPercent": {
+      "type": "number",
+      "default": 96,
+      "title": "Subagents stop percent",
+      "description": "Running subagents stop at this percent of the 5-hour limit"
+    },
+    "mainStopPercent": {
+      "type": "number",
+      "default": 98,
+      "title": "Main stop percent",
+      "description": "Main session stops starting work at this percent of the 5-hour limit"
+    },
+    "weekStopPercent": {
+      "type": "number",
+      "default": 99,
+      "title": "Weekly stop percent",
+      "description": "Stop and tell the person at this percent of a weekly limit"
+    },
+    "pingMinutes": {
+      "type": "number",
+      "default": 45,
+      "title": "Ping interval (minutes)",
+      "description": "Keep-alive ping interval in minutes (kept under 55)"
+    }
   }
 }

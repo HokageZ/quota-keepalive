@@ -59,7 +59,10 @@ const pingMs = (o: Options, ov: Overrides): number => {
   return Math.min(55, Math.max(1, m)) * MINUTE
 }
 
-const refreshMs = (o: Options): number => Math.max(1, num(o.refreshMinutes, 10)) * MINUTE
+// The panel's pass, as often as the cache-countdown band's: reading the plan limits is local and free.
+const TICK_MS = 15_000
+// Pace keeps one reading a minute, so six hours of history fit in MAX_SAMPLES.
+const SAMPLE_EVERY = MINUTE
 
 const thresholdsOf = (o: Options, ov: Overrides): Thresholds => ({ ...baseThresholds(o), ...ov.thresholds })
 
@@ -125,7 +128,9 @@ async function refresh($: EngineInterface): Promise<void> {
   }
 
   const sample: Sample = { at: now, fiveHour: limits?.fiveHour?.percent ?? null, weekAll: limits?.weekAll?.percent ?? null }
-  const samples = [...q.samples, sample].filter(s => now - s.at <= SAMPLE_SPAN).slice(-MAX_SAMPLES)
+  const last = q.samples[q.samples.length - 1]
+  const kept = last && now - last.at < SAMPLE_EVERY ? q.samples : [...q.samples, sample]
+  const samples = kept.filter(s => now - s.at <= SAMPLE_SPAN).slice(-MAX_SAMPLES)
   await update($, quota, prev => ({ ...prev, limits, samples, refreshedAt: now, needsRefresh: false, unavailable }))
 }
 
@@ -243,8 +248,8 @@ async function tick($: EngineInterface, opts: Options): Promise<void> {
   ticking = true
   try {
     const now = await $.clock.now()
-    const q = await read($, quota)
-    if (q.needsRefresh || !q.limits || now - q.refreshedAt >= refreshMs(opts)) await refresh($)
+    // Every pass reads the limits afresh; the write redraws the panel, so its countdowns stay live.
+    await refresh($)
     await judge($, opts)
 
     const p = await read($, pause)
@@ -467,7 +472,7 @@ export const register: Register = (on, options) => {
     await loadSettings($)
     void $.ui.open({ id: PANE, title: 'Quota' })
     await tick($, opts)
-    $.clock.every(MINUTE, () => {
+    $.clock.every(TICK_MS, () => {
       void tick($, opts)
     })
     return started
@@ -494,11 +499,16 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  // A subagent's turn ended: read its status, and take a fresh reading (once per subagent end, never per turn).
+  // A turn ended: take a fresh reading at once, so the panel shows what that turn spent.
+  // A subagent's end also records whether it paused for quota.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
     const agentId = (e as unknown as { agentId?: string }).agentId
-    if (!agentId) return r
+    if (!agentId) {
+      await refresh($)
+      await judge($, opts)
+      return r
+    }
     const text = String((r as unknown as { text?: string }).text ?? '')
     const saysPaused = /paused for quota/i.test(text)
     await update($, agents, map => {

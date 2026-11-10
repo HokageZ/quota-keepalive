@@ -145,3 +145,18 @@ test('settings live in the panel and are saved for the next session', async ($, 
   expect(JSON.stringify(saved.at(-1))).toContain('"mainStop":95')
   await ui.unmount()
 })
+
+test('the panel follows new readings by itself within 15 seconds, no Refresh pressed', async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  const readings = { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }
+  engine(on, readings, clock.now)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^20%$/ }))?.text).toBeTruthy()
+  readings.five = 35
+  await clock.advance(15_000)
+  expect((await ui.find({ type: 'Text', text: /^35%$/ }))?.text).toBeTruthy()
+  await ui.unmount()
+})
