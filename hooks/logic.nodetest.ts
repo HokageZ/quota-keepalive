@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { EMPTY_STATS, addUsage, cachedNow, fmtTok, hitRate } from './logic.ts'
+import { EMPTY_STATS, addUsage, cacheWarm, cachedNow, fmtTok, hitRate } from './logic.ts'
 import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, limitSpent, pingPlan, planDue, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
 import type { Limits } from './logic.ts'
 
@@ -221,4 +221,11 @@ test('hit rate and token counts', () => {
   assert.equal(fmtTok(250_400), '250k')
   assert.equal(fmtTok(1_320_000), '1.32M')
   assert.equal(fmtTok(2_000_000), '2M')
+})
+
+test('a cache is warm only within its hour after a write; never written is cold', () => {
+  assert.equal(cacheWarm(0, 10 * MINUTE), false)
+  assert.equal(cacheWarm(HOUR, HOUR + 59 * MINUTE), true)
+  assert.equal(cacheWarm(HOUR, 2 * HOUR), false)
+  assert.equal(cacheWarm(HOUR, HOUR + 4 * MINUTE, 5 * MINUTE), true)
 })

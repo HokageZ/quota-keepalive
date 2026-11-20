@@ -15,7 +15,7 @@ import {
   limitSpent,
   pingPlan,
   planDue,
-  cacheWrittenAt,
+  cacheWarm,
   fmtDur,
   keepAliveWorth,
   nextClock,
@@ -256,12 +256,10 @@ async function keepWarm($: EngineInterface): Promise<void> {
   if (spentNow(await read($, quota))) return
   if ((await read($, warm)).busy) return
   const m = await read($, main)
-  const writtenAt = cacheWrittenAt(m.lastCacheAt, tgt.startedAt)
-  // A ping went out, nothing wrote the cache since, and the cache is past its hour: it is gone,
-  // so stop retrying until something writes it again (a message of the person's).
-  const dead = tgt.lastPingAt > writtenAt && now - writtenAt >= HOUR
-
-  if (!dead && planDue(pingPlan(writtenAt, tgt.until), tgt.lastPingAt, now)) {
+  // Never rewarm a cold cache: a ping only keeps a warm one warm. Once it has lapsed (a ping that
+  // did not land, a machine asleep) or before any reply wrote it, pinging waits until the person's
+  // own message warms it, then the plan runs again from that write.
+  if (cacheWarm(m.lastCacheAt, now) && planDue(pingPlan(m.lastCacheAt, tgt.until), tgt.lastPingAt, now)) {
     if (tgt.source === 'pause') await update($, pause, prev => ({ ...prev, lastPingAt: now }))
     else await update($, keep, prev => ({ ...prev, lastPingAt: now }))
     await update($, stats, s => ({ ...EMPTY_STATS, ...s, pings: (s?.pings ?? 0) + 1 }))
@@ -272,7 +270,9 @@ async function keepWarm($: EngineInterface): Promise<void> {
   const map = await read($, agents)
   for (const [id, a] of Object.entries(map)) {
     if (a.status !== 'paused') continue
-    if (!planDue(pingPlan(cacheWrittenAt(a.lastCacheAt, tgt.startedAt), tgt.until), a.lastPingAt ?? 0, now)) continue
+    // The same rule per subagent: its cache is kept warm only while it is still warm.
+    if (!cacheWarm(a.lastCacheAt, now)) continue
+    if (!planDue(pingPlan(a.lastCacheAt, tgt.until), a.lastPingAt ?? 0, now)) continue
     await update($, agents, all => (all[id] ? { ...all, [id]: { ...all[id], lastPingAt: now } } : all))
     await update($, stats, s => ({ ...EMPTY_STATS, ...s, pings: (s?.pings ?? 0) + 1 }))
     try {
@@ -372,8 +372,10 @@ async function rows($: EngineInterface, opts: Options): Promise<string[]> {
       ? 'keep warm off'
       : p.kind === 'quota' && !keepAliveWorth(p.until, now)
         ? 'no pings: the pause ends too far off to keep the cache warm'
-        : (() => {
-            const plan = pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
+        : !cacheWarm(m.lastCacheAt, now)
+          ? 'cold: not rewarmed; your next message warms it'
+          : (() => {
+            const plan = pingPlan(m.lastCacheAt, tgt.until)
             return plan ? `next ping in ${fmtDur(Math.max(0, plan.next - now))}` : 'no ping needed before the end'
           })()
     out.push(`Main cache: ${fmtDur(age)} old; ${due}`)
@@ -547,9 +549,11 @@ async function setKeep($: EngineInterface, choice: KeepState['choice']): Promise
     await update($, keep, () => NO_KEEP)
     return p.kind === 'none' ? 'Not keeping the cache warm.' : continueNow($)
   }
+  // A cold cache is not rewarmed: say that keep warm starts with the person's next message.
+  const coldNote = cacheWarm((await read($, main)).lastCacheAt, now) ? '' : ' The cache is cold now, so it starts after your next message.'
   if (choice === 'always') {
     await update($, keep, () => ({ choice, until: null, startedAt: now, lastPingAt: 0 }))
-    return 'Keeping the cache warm until you turn it off.'
+    return `Keeping the cache warm until you turn it off.${coldNote}`
   }
   const q = await read($, quota)
   const reset = q.limits?.fiveHour?.resetsAt ?? null
@@ -558,7 +562,7 @@ async function setKeep($: EngineInterface, choice: KeepState['choice']): Promise
   await update($, keep, () => ({ choice, until, startedAt: now, lastPingAt: 0 }))
   // A pause the person set follows the new end; a limit's pause keeps waiting on its reset.
   if (p.kind === 'time') await update($, pause, prev => ({ ...prev, until }))
-  return `Keeping the cache warm until ${new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
+  return `Keeping the cache warm until ${new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.${coldNote}`
 }
 
 async function pauseWork($: EngineInterface): Promise<string> {
@@ -828,7 +832,8 @@ export const register: Register = (on, options) => {
     const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
     const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
     const spent = spentNow(q)
-    const plan = !tgt || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
+    const coldNow = !cacheWarm(m.lastCacheAt, now)
+    const plan = !tgt || farOff || spent || coldNow ? null : pingPlan(m.lastCacheAt, tgt.until)
     const chosen: KeepState['choice'] = p.kind === 'quota' ? 'reset' : k.choice
     const hit = hitRate(st.read, st.written, st.uncached)
     const inCache = cachedNow(st)
@@ -929,6 +934,10 @@ export const register: Register = (on, options) => {
       ) : busy ? (
         <Text key="plan" dimColor>
           A turn is running; it keeps the cache warm.
+        </Text>
+      ) : coldNow ? (
+        <Text key="plan" dimColor>
+          The cache is cold, so it is not rewarmed. Your next message warms it, and keep warm carries on from there.
         </Text>
       ) : plan === null ? (
         <Text key="plan" dimColor>
@@ -1310,7 +1319,8 @@ export const register: Register = (on, options) => {
     const tgt = await warmTarget($)
     const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
-    const plan = tgt && !farOff && !spentNow(q) ? pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until) : null
+    const cold = !cacheWarm(m.lastCacheAt, now)
+    const plan = tgt && !farOff && !spentNow(q) && !cold ? pingPlan(m.lastCacheAt, tgt.until) : null
     const holdText = !tgt
       ? null
       : p.kind !== 'none'
@@ -1324,7 +1334,9 @@ export const register: Register = (on, options) => {
         ? 'no pings: the reset is days off'
         : spentNow(q)
           ? 'no pings: limit at 100%'
-          : plan === null
+          : cold
+            ? 'cold: not rewarmed until you send'
+            : plan === null
             ? 'no ping needed'
             : `${plan.left === null ? 'ping' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} · next ${fmtDur(Math.max(0, plan.next - now))}`
 

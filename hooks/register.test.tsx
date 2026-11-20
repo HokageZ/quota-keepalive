@@ -80,8 +80,10 @@ test('the pane draws its controls on every surface; keep warm, then pause work u
 test('a pause pings the main session on the cache clock and retries a ping that did not land', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
   const pings = engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await reply($, on) // the person's last message warmed the cache
 
   const at = new Date(clock.now() + 3 * HOUR)
   const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
@@ -95,11 +97,48 @@ test('a pause pings the main session on the cache clock and retries a ping that 
   // No turn wrote the cache after that ping (it did not land): tried again 5 minutes on, not 45.
   await clock.advance(5 * MINUTE)
   expect(keepAlive()).toBe(2)
-  // Once the cache is past its hour with no write, it is gone: no more retries every 5 minutes.
+  // Once the cache is past its hour with no write, it is cold: it is not rewarmed, no more pings.
   await clock.advance(5 * MINUTE)
   expect(keepAlive()).toBe(3)
   await clock.advance(2 * HOUR)
   expect(keepAlive()).toBe(3)
+})
+
+test('a cold cache is never rewarmed; the person\'s own message warms it and keep warm carries on', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
+  const pings = engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
+  mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const count = () => pings.filter(t => t === 'ping').length
+
+  // No reply yet: nothing was warmed, so Always sends nothing, and says why.
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'keep-always' })
+  await clock.settle()
+  expect((await ui.find({ type: 'Text', text: /cache is cold now, so it starts after your next message/ }))?.text).toBeTruthy()
+  expect((await ui.find({ type: 'Text', text: /^The cache is cold, so it is not rewarmed/ }))?.text).toBeTruthy()
+  await clock.advance(2 * HOUR)
+  expect(count()).toBe(0)
+
+  // The person writes: the cache is warm, and keep warm holds it from there.
+  await reply($, on)
+  await clock.advance(51 * MINUTE)
+  expect(count()).toBe(1)
+
+  // That ping did not land: one retry 5 minutes on, then the hour passes and the cache is cold
+  // again. It stays cold while they are away: no more pings.
+  await clock.advance(3 * HOUR)
+  expect(count()).toBe(2)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^cold: not rewarmed until you send$/ }))?.text).toBeTruthy()
+  await band.unmount()
+
+  // Back again: their message warms it, and the pings resume 50 minutes on.
+  await reply($, on)
+  await clock.advance(51 * MINUTE)
+  expect(count()).toBe(3)
+  await ui.unmount()
 })
 
 test('a weekly quota pause days from its reset sends no keep-alive pings', async ($, on) => {
@@ -196,8 +235,10 @@ test('at 100% of a limit the keep-alive stands down: no pings, and the panel say
 test('keep warm until a reset 3 hours off plans 3 pings, 45 minutes apart', async ($, on) => {
   const clock = mock.clock(on, { now: Date.UTC(2026, 10, 10, 8, 0) })
   engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
+  engineStep(on)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await reply($, on) // a warm cache to keep
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'keep-reset' })
   await clock.settle()
@@ -433,7 +474,7 @@ test('/quota keep always turns it on from the prompt, and off again', async ($, 
   engine(on, { five: 20, week: 30, weekResetsIn: 4 * 24 * HOUR }, clock.now)
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-  expect((await $.command.run({ command: 'quota', args: 'keep always' })).text).toBe('Keeping the cache warm until you turn it off.')
+  expect((await $.command.run({ command: 'quota', args: 'keep always' })).text).toContain('Keeping the cache warm until you turn it off.')
   expect((await $.command.run({ command: 'quota', args: 'show' })).text).toContain('Keep warm: always on')
   expect((await $.command.run({ command: 'quota', args: 'keep off' })).text).toBe('Not keeping the cache warm.')
 })

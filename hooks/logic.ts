@@ -149,6 +149,13 @@ export function pingPlan(writtenAt: number, until: number | null, ttl = CACHE_TT
   return { next: writtenAt + gap, gap, left: parts - 1 }
 }
 
+// Is the cache warm now: a reply wrote it, less than its lifetime ago. Keep warm only keeps a warm
+// cache warm; a cold one (lapsed, or never written) is never rewarmed by a ping. The person's own
+// message warms it again, and keep warm picks up from that write.
+export function cacheWarm(lastCacheAt: number, now: number, ttl = CACHE_TTL): boolean {
+  return lastCacheAt > 0 && now - lastCacheAt < ttl
+}
+
 // Is a planned ping due now: its time came, and no ping went out in the last PING_RETRY
 // (one in flight, or one that did not land, is tried again then).
 export function planDue(plan: PingPlan | null, lastPingAt: number, now: number): boolean {
