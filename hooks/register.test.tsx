@@ -340,6 +340,8 @@ test('the band above the prompt: cache time left and what to re-cache; Settings 
     // 50,000 read from the cache: 50k cached, and the 10 uncached tokens are the misses.
     expect((await band.find({ type: 'Text', text: /^cached$/ }))?.text).toBeTruthy()
     expect((await band.find({ type: 'Text', text: /^50k$/ }))?.text).toBeTruthy()
+    // What a re-cache would write if the cache lapsed: 10 input + 50,000 read + 20 output, about 50k.
+    expect((await band.find({ type: 'Text', text: surface === 'desktop' ? /^to re-cache$/ : /^re-cache$/ }))?.text).toBeTruthy()
     expect((await band.find({ type: 'Text', text: /^miss$/ }))?.text).toBeTruthy()
     expect((await band.find({ type: 'Text', text: /^0%$/ }))?.text).toBeTruthy()
     // No warning at 20%.
@@ -381,8 +383,9 @@ test('at the stop the band shows the pause and the pings that keep the cache to 
     const band = await $.ui.mount({ ...BAND, surface })
     expect((await band.find({ type: 'Text', text: /^Paused until/ }))?.text).toBeTruthy()
     expect((await band.find({ type: 'Text', text: /^3 pings · next 45m$/ }))?.text).toBeTruthy()
-    // While paused the row keeps to what matters: no re-cache stat, no "of 60 min".
-    expect(await band.find({ type: 'Text', text: /re-cache|of 60 min/ })).toBeFalsy()
+    // While paused the row keeps to what matters: the re-cache cost stays; "cached" and "of 60 min" go.
+    expect((await band.find({ type: 'Text', text: /^(to )?re-cache$/ }))?.text).toBeTruthy()
+    expect(await band.find({ type: 'Text', text: /^cached$|of 60 min/ })).toBeFalsy()
     expect(await band.find({ key: 'band-open' })).toBeTruthy()
     await band.unmount()
   }

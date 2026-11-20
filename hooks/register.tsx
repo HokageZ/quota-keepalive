@@ -1382,7 +1382,9 @@ export const register: Register = (on, options) => {
             )}
           </Box>
           <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap" justifyContent="flex-end">
-            {isWarm ? (isNarrow ? null : stat(cached, 'cached')) : stat(`${recache} tokens`, 'to re-cache', 'error')}
+            {isWarm ? (isNarrow || holdText ? null : stat(cached, 'cached')) : null}
+            {/* What a re-cache would write: the whole context, if the cache lapses before the next message. */}
+            {isWarm ? stat(recache, 'to re-cache') : stat(`${recache} tokens`, 'to re-cache', 'error')}
             {miss === null ? null : stat(miss, 'miss', missTone)}
             {extras()}
           </Box>
@@ -1422,7 +1424,7 @@ export const register: Register = (on, options) => {
         )
       } else {
         // The bar takes what the row leaves: status and time on the left, the stats on the right.
-        const cells = Math.max(6, Math.min(24, e.props.bodyColumns - (isNarrow ? 44 : 100)))
+        const cells = Math.max(6, Math.min(24, e.props.bodyColumns - (isNarrow ? 58 : 114)))
         const filled = Math.max(1, Math.round(share * cells))
         const leftText =
           left >= HOUR ? `${Math.floor(left / HOUR)}h ${Math.floor((left % HOUR) / 60000)}m` : left >= 60 * 1000 ? `${Math.ceil(left / 60000)}m` : `${Math.ceil(left / 1000)}s`
@@ -1442,7 +1444,8 @@ export const register: Register = (on, options) => {
               </Box>
             </Box>
             <Box gap={2} flexShrink={1} flexWrap="wrap">
-              {isNarrow ? null : stat('cached', cached)}
+              {isNarrow || holdText ? null : stat('cached', cached)}
+              {stat('re-cache', recache)}
               {miss === null ? null : stat('miss', miss, missTone)}
               {extras()}
             </Box>
