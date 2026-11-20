@@ -87,7 +87,7 @@ test('a pause pings the main session on the cache clock and retries a ping that 
   const hhmm = `${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')}`
   await $.command.run({ command: 'quota', args: `pause until ${hhmm}` })
 
-  const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
+  const keepAlive = () => pings.filter(t => t === 'ping').length
   await clock.advance(44 * MINUTE)
   expect(keepAlive()).toBe(0)
   await clock.advance(2 * MINUTE)
@@ -103,7 +103,7 @@ test('a weekly quota pause days from its reset sends no keep-alive pings', async
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(3 * HOUR)
-  expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
+  expect(pings.filter(t => t === 'ping').length).toBe(0)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /^Work paused by the Weekly/ }))?.text).toBeTruthy()
@@ -176,7 +176,7 @@ test('at 100% of a limit the keep-alive stands down: no pings, and the panel say
   mock.session(on)
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.advance(2 * HOUR)
-  expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
+  expect(pings.filter(t => t === 'ping').length).toBe(0)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /limit is at 100%/ }))?.text).toBeTruthy()
@@ -231,7 +231,7 @@ test('keep warm 2h while idle: pings 40 minutes apart, then it ends by itself', 
   await reply($, on)
   await ui.press({ key: 'keep-2' })
   await clock.settle()
-  const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
+  const keepAlive = () => pings.filter(t => t === 'ping').length
 
   // 2 hours in gaps of at most 50 minutes: 3 equal gaps of 40 minutes.
   await clock.advance(39 * MINUTE)
@@ -263,7 +263,7 @@ test('your own replies count: one that writes the cache moves the next ping back
   await clock.advance(25 * MINUTE)
   await reply($, on)
   await clock.advance(34 * MINUTE)
-  expect(pings.filter(t => t.startsWith('Keep-alive ping')).length).toBe(0)
+  expect(pings.filter(t => t === 'ping').length).toBe(0)
   await ui.unmount()
 })
 
@@ -283,7 +283,7 @@ test('the bridge: a stop level pauses work by itself and keeps the cache warm to
   expect(JSON.stringify(rows.appended())).toContain('stop starting new work')
 
   // 3 hours to the reset: pings at 45, 90 and 135 minutes.
-  const keepAlive = () => pings.filter(t => t.startsWith('Keep-alive ping')).length
+  const keepAlive = () => pings.filter(t => t === 'ping').length
   await clock.advance(44 * MINUTE)
   expect(keepAlive()).toBe(0)
   await clock.advance(2 * MINUTE)

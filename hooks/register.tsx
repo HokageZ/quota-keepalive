@@ -30,9 +30,10 @@ const SAMPLE_SPAN = 6 * HOUR
 const MAX_SAMPLES = 400
 const MAX_ROWS = 12
 
-// Words the model reads on each ping. A ping does nothing but keep the cache warm.
-const PING_MAIN = 'Keep-alive ping from the quota mod. Reply with the single word ok and do nothing else.'
-const PING_AGENT = 'Keep-alive ping from the quota mod. Reply with the single word ok and do nothing else; stay paused.'
+// What a keep-alive ping says. One word: the model answers in a word, so a ping costs a cache
+// read of the prefix and a few output tokens, and the transcript row stays small.
+export const PING_MAIN = 'ping'
+export const PING_AGENT = 'ping'
 
 const quota = atom({ plugin: 'quota-keepalive', key: 'quota' } as const, { limits: null, samples: [], said: [], refreshedAt: 0, needsRefresh: true, unavailable: '' } as QuotaState, { shape: SHAPE })
 const overrides = atom({ plugin: 'quota-keepalive', key: 'overrides' } as const, { thresholds: {}, simulate: null, weekModelPercent: null, pingMinutes: null } as Overrides, { shape: SHAPE })
