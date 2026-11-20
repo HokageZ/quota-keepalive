@@ -43,6 +43,8 @@ export type Overrides = {
   simulate: { fiveHour: number; week: number } | null
   weekModelPercent: number | null
   pingMinutes: number | null
+  // What keep warm a new chat starts with (Settings, saved for every session); absent is 'off'.
+  defaultKeep?: 'off' | 'always'
 }
 
 export type PauseState = {
@@ -67,15 +69,39 @@ export type WarmFacts = {
   lastWorkAt: number
   lastPingAt: number
   busy: boolean
+  // The main turn a keep-alive ping started, so its tokens count as the ping's.
+  pingTurn?: string
+  // The new-chat default (Settings) was applied in this session; a reload does not apply it again.
+  defaultApplied?: boolean
 }
 
-// What the person asked for: keep the cache warm until a time, or the 5-hour reset ('reset',
-// read live), or not at all ('off').
+// What the person asked for: keep the cache warm until a time, until the 5-hour reset ('reset'),
+// with no end until they turn it off ('always'), or not at all ('off').
 export type KeepState = {
-  choice: 'off' | '1' | '2' | '4' | 'reset'
+  choice: 'off' | '1' | '2' | '4' | 'reset' | 'always'
   until: number | null
   startedAt: number
   lastPingAt: number
+}
+
+// Prompt-cache totals for the session (see CacheStats in hooks/logic.ts).
+export type CacheStats = {
+  calls: number
+  read: number
+  written: number
+  uncached: number
+  output: number
+  rebuilds: number
+  lastAt: number
+  lastRebuildAt: number
+  last: { read: number; written: number; uncached: number } | null
+  pings: number
+  pingRead: number
+  pingWritten: number
+  agentCalls: number
+  agentRead: number
+  agentWritten: number
+  agentUncached: number
 }
 
 export type AgentState = {
@@ -99,6 +125,7 @@ declare module 'claude-code' {
       settingsOpen: Shaped<boolean>
       keep: Shaped<KeepState>
       warm: Shaped<WarmFacts>
+      stats: Shaped<CacheStats>
     }
   }
 }

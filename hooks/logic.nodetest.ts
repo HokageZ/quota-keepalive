@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { EMPTY_STATS, addUsage, cachedNow, fmtTok, hitRate } from './logic.ts'
 import { DEFAULT_THRESHOLDS, HOUR, MINUTE, PING_RETRY, alertsFor, limitSpent, pingPlan, planDue, cachePingDue, cacheWrittenAt, keepAliveWorth, quotaBack, familyOf, fmtDur, outlookOf, paceOf, pingDue, resetPassed, spendsWindow, nextClock } from './logic.ts'
 import type { Limits } from './logic.ts'
 
@@ -184,4 +185,40 @@ test("person's rule: equal pings to the reset, 10-minute margin, the cache never
     // The fewest pings that keep the margin: one fewer would need a gap over 50 minutes.
     assert.equal(gaps.length, Math.max(0, Math.ceil(wait / 50) - 1), `wait ${wait}m`)
   }
+})
+
+test('cache stats: totals, rebuilds, ping tokens and subagents kept apart', () => {
+  let s = addUsage(null, { input_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 40_000, output_tokens: 50 }, 1, { agent: false, ping: false })
+  assert.equal(s.rebuilds, 1)
+  assert.equal(s.lastRebuildAt, 1)
+  s = addUsage(s, { input_tokens: 5, cache_read_input_tokens: 40_000, cache_creation_input_tokens: 1_000, output_tokens: 50 }, 2, { agent: false, ping: false })
+  assert.equal(s.rebuilds, 1, 'a call that read more than it wrote is no rebuild')
+  s = addUsage(s, { input_tokens: 10, cache_read_input_tokens: 41_000, cache_creation_input_tokens: 0, output_tokens: 2 }, 3, { agent: false, ping: true })
+  assert.equal(s.calls, 3)
+  assert.equal(s.read, 81_000)
+  assert.equal(s.written, 41_000)
+  assert.equal(s.uncached, 20)
+  assert.equal(s.pingRead, 41_000)
+  assert.equal(cachedNow(s), 41_000)
+  const agent = addUsage(s, { input_tokens: 1, cache_read_input_tokens: 9, cache_creation_input_tokens: 0, output_tokens: 1 }, 4, { agent: true, ping: false })
+  assert.equal(agent.calls, 3, 'a subagent call leaves the main totals alone')
+  assert.equal(agent.agentCalls, 1)
+  assert.equal(agent.agentRead, 9)
+  // An older stored value without the new fields still adds up.
+  const old = addUsage({ calls: 2, read: 10 } as never, { cache_read_input_tokens: 5 }, 5, { agent: false, ping: false })
+  assert.equal(old.calls, 3)
+  assert.equal(old.read, 15)
+  assert.equal(old.pings, 0)
+  assert.deepEqual(addUsage(undefined, {}, 0, { agent: true, ping: false }).last, EMPTY_STATS.last)
+})
+
+test('hit rate and token counts', () => {
+  assert.equal(hitRate(0, 0, 0), null)
+  assert.equal(hitRate(90, 5, 5), 0.9)
+  assert.equal(fmtTok(950), '950')
+  assert.equal(fmtTok(12_400), '12.4k')
+  assert.equal(fmtTok(50_000), '50k')
+  assert.equal(fmtTok(250_400), '250k')
+  assert.equal(fmtTok(1_320_000), '1.32M')
+  assert.equal(fmtTok(2_000_000), '2M')
 })

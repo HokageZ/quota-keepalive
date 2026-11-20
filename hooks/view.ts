@@ -38,6 +38,34 @@ export function ringSvg(share: number, tone: Tone): string {
   )
 }
 
+// The panel's header ring: 64 px, filled to `share`, with the time left in its middle and a
+// small caption under it. Gray for the track and caption reads on a light and a dark panel.
+export function heroRingSvg(share: number, tone: Tone, text: string, caption: string): string {
+  const s = clamp01(share)
+  const r = 27
+  const c = 2 * Math.PI * r
+  const arc = (c * s).toFixed(2)
+  const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  return (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">' +
+    `<circle cx="32" cy="32" r="${r}" fill="none" stroke="rgba(128,128,128,0.22)" stroke-width="5"/>` +
+    (s > 0
+      ? `<circle cx="32" cy="32" r="${r}" fill="none" stroke="${HUE[tone]}" stroke-width="5" stroke-linecap="round" stroke-dasharray="${arc} ${c.toFixed(2)}" transform="rotate(-90 32 32)"/>`
+      : '') +
+    `<text x="32" y="${caption ? 33 : 37}" font-size="${text.length > 4 ? 12 : 14}" font-weight="700" fill="${HUE[tone]}" text-anchor="middle" font-family="system-ui,-apple-system,Segoe UI,sans-serif">${esc(text)}</text>` +
+    (caption
+      ? `<text x="32" y="45" font-size="8.5" fill="rgba(128,128,128,0.95)" text-anchor="middle" font-family="system-ui,-apple-system,Segoe UI,sans-serif">${esc(caption)}</text>`
+      : '') +
+    '</svg>'
+  )
+}
+
+// The tone of a cache hit rate: green from 80%, amber from 50%, red under it.
+export function hitTone(rate: number): Tone {
+  if (rate >= 0.8) return 'success'
+  return rate >= 0.5 ? 'warning' : 'error'
+}
+
 export const BAR_WIDTH = 320
 export const BAR_HEIGHT = 10
 

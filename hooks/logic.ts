@@ -198,6 +198,99 @@ export function fmtDur(ms: number): string {
   return h ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`
 }
 
+// Prompt-cache totals for the session, from each model call's usage.
+// read: tokens served from the cache (hits); written: tokens written to it (misses that get
+// cached); uncached: input neither read nor written. A rebuild is a call that wrote more than
+// it read: the cache had lapsed (or it was the first call), so the whole prefix was paid again.
+export type CacheStats = {
+  calls: number
+  read: number
+  written: number
+  uncached: number
+  output: number
+  rebuilds: number
+  lastAt: number
+  lastRebuildAt: number
+  // The last main call: what it read, wrote and sent uncached.
+  last: { read: number; written: number; uncached: number } | null
+  // Keep-alive pings sent (main and subagents), and what the main pings' calls read and wrote.
+  pings: number
+  pingRead: number
+  pingWritten: number
+  // Subagents' calls, kept apart so the main hit rate is the session's own.
+  agentCalls: number
+  agentRead: number
+  agentWritten: number
+  agentUncached: number
+}
+
+export const EMPTY_STATS: CacheStats = {
+  calls: 0,
+  read: 0,
+  written: 0,
+  uncached: 0,
+  output: 0,
+  rebuilds: 0,
+  lastAt: 0,
+  lastRebuildAt: 0,
+  last: null,
+  pings: 0,
+  pingRead: 0,
+  pingWritten: 0,
+  agentCalls: 0,
+  agentRead: 0,
+  agentWritten: 0,
+  agentUncached: 0,
+}
+
+export type Usage = { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+
+// Adds one call's usage. A stored value from an older version may lack fields: they start at 0.
+export function addUsage(prev: Partial<CacheStats> | null | undefined, u: Usage, now: number, who: { agent: boolean; ping: boolean }): CacheStats {
+  const s: CacheStats = { ...EMPTY_STATS, ...(prev ?? {}) }
+  const read = u.cache_read_input_tokens || 0
+  const written = u.cache_creation_input_tokens || 0
+  const uncached = u.input_tokens || 0
+  if (who.agent) {
+    return { ...s, agentCalls: s.agentCalls + 1, agentRead: s.agentRead + read, agentWritten: s.agentWritten + written, agentUncached: s.agentUncached + uncached }
+  }
+  const rebuild = written > read && written > 0
+  return {
+    ...s,
+    calls: s.calls + 1,
+    read: s.read + read,
+    written: s.written + written,
+    uncached: s.uncached + uncached,
+    output: s.output + (u.output_tokens || 0),
+    rebuilds: s.rebuilds + (rebuild ? 1 : 0),
+    lastAt: now,
+    lastRebuildAt: rebuild ? now : s.lastRebuildAt,
+    last: { read, written, uncached },
+    pingRead: s.pingRead + (who.ping ? read : 0),
+    pingWritten: s.pingWritten + (who.ping ? written : 0),
+  }
+}
+
+// The share of input tokens the cache served, 0 to 1; null before any input was seen.
+export function hitRate(read: number, written: number, uncached: number): number | null {
+  const total = read + written + uncached
+  return total > 0 ? read / total : null
+}
+
+// The size of the cached prefix after the last call: what it read plus what it wrote.
+export function cachedNow(s: Partial<CacheStats> | null | undefined): number {
+  const l = s?.last
+  return l ? l.read + l.written : 0
+}
+
+// Token counts, short: 950, 12.4k, 1.32M.
+export function fmtTok(n: number): string {
+  if (n < 1000) return String(Math.round(n))
+  if (n < 100_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`
+  if (n < 1_000_000) return `${Math.round(n / 1000)}k`
+  return `${(n / 1_000_000).toFixed(2).replace(/\.?0+$/, '')}M`
+}
+
 // Which family of model: 'opus', 'sonnet', 'haiku', 'fable', or the id as it came.
 export function familyOf(model: string): string {
   const m = /(fable|mythos|opus|sonnet|haiku)/i.exec(model)
