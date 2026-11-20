@@ -1,9 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AgentState, KeepState, MainState, Overrides, PauseState, QuotaLimits, QuotaState, QuotaWindow, WarmFacts } from '../types'
+import type { AgentState, CacheStats, KeepState, MainState, Overrides, PauseState, QuotaLimits, QuotaState, QuotaWindow, WarmFacts } from '../types'
 import {
   DEFAULT_THRESHOLDS,
+  EMPTY_STATS,
+  addUsage,
+  cachedNow,
+  fmtTok,
+  hitRate,
   HOUR,
   MINUTE,
   alertsFor,
@@ -21,7 +26,7 @@ import {
   windowsOf,
 } from './logic'
 import type { Alert, Sample, Thresholds } from './logic'
-import { barSvg, blocks, cacheTone, pct, ringSvg, scaleSvg, toneOf } from './view'
+import { barSvg, blocks, cacheTone, heroRingSvg, hitTone, pct, ringSvg, scaleSvg, toneOf } from './view'
 import type { Tone } from './view'
 
 const PANE = 'quota'
@@ -46,6 +51,7 @@ const NO_KEEP: KeepState = { choice: 'off', until: null, startedAt: 0, lastPingA
 const keep = atom({ plugin: 'quota-keepalive', key: 'keep' } as const, NO_KEEP, { shape: SHAPE })
 const warm = atom({ plugin: 'quota-keepalive', key: 'warm' } as const, { lastWorkAt: 0, lastPingAt: 0, busy: false } as WarmFacts, { shape: SHAPE })
 const agents = atom({ plugin: 'quota-keepalive', key: 'agents' } as const, {} as Record<string, AgentState>, { shape: SHAPE })
+const stats = atom({ plugin: 'quota-keepalive', key: 'stats' } as const, EMPTY_STATS as CacheStats, { shape: SHAPE })
 
 type Options = Record<string, unknown>
 
@@ -192,7 +198,9 @@ async function resume($: EngineInterface, why: string): Promise<string> {
   const p = await read($, pause)
   if (p.kind === 'none') return 'Nothing is paused.'
   await update($, pause, () => NO_PAUSE)
-  await update($, keep, () => NO_KEEP)
+  // A timed keep warm ends with the pause; Always stays on until the person turns it off.
+  const now = await $.clock.now()
+  await update($, keep, k => (k.choice === 'always' ? { ...k, startedAt: now, lastPingAt: 0 } : NO_KEEP))
   const list = await $.agent.list()
   const map = await read($, agents)
   for (const a of list) {
@@ -222,8 +230,11 @@ async function warmTarget($: EngineInterface): Promise<Target | null> {
   if (p.kind !== 'none') return { until: p.until, startedAt: p.startedAt, lastPingAt: p.lastPingAt, source: 'pause' }
   const k = await read($, keep)
   if (k.choice === 'off') return null
+  // Always: no end, a ping every 50 minutes of idle until the person turns it off.
+  if (k.choice === 'always') return { until: null, startedAt: k.startedAt, lastPingAt: k.lastPingAt, source: 'keep' }
+  // Until reset: the reset as it was when picked (a value stored before that was kept reads it live).
   const q = await read($, quota)
-  const until = k.choice === 'reset' ? (q.limits?.fiveHour?.resetsAt ?? null) : k.until
+  const until = k.choice === 'reset' ? (k.until ?? q.limits?.fiveHour?.resetsAt ?? null) : k.until
   return { until, startedAt: k.startedAt, lastPingAt: k.lastPingAt, source: 'keep' }
 }
 
@@ -245,10 +256,15 @@ async function keepWarm($: EngineInterface): Promise<void> {
   if (spentNow(await read($, quota))) return
   if ((await read($, warm)).busy) return
   const m = await read($, main)
+  const writtenAt = cacheWrittenAt(m.lastCacheAt, tgt.startedAt)
+  // A ping went out, nothing wrote the cache since, and the cache is past its hour: it is gone,
+  // so stop retrying until something writes it again (a message of the person's).
+  const dead = tgt.lastPingAt > writtenAt && now - writtenAt >= HOUR
 
-  if (planDue(pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until), tgt.lastPingAt, now)) {
+  if (!dead && planDue(pingPlan(writtenAt, tgt.until), tgt.lastPingAt, now)) {
     if (tgt.source === 'pause') await update($, pause, prev => ({ ...prev, lastPingAt: now }))
     else await update($, keep, prev => ({ ...prev, lastPingAt: now }))
+    await update($, stats, s => ({ ...EMPTY_STATS, ...s, pings: (s?.pings ?? 0) + 1 }))
     $.prompt.submit({ text: PING_MAIN }).catch(err => $.ui.log(`quota: keep-warm ping failed: ${(err as Error).message}`))
   }
 
@@ -258,6 +274,7 @@ async function keepWarm($: EngineInterface): Promise<void> {
     if (a.status !== 'paused') continue
     if (!planDue(pingPlan(cacheWrittenAt(a.lastCacheAt, tgt.startedAt), tgt.until), a.lastPingAt ?? 0, now)) continue
     await update($, agents, all => (all[id] ? { ...all, [id]: { ...all[id], lastPingAt: now } } : all))
+    await update($, stats, s => ({ ...EMPTY_STATS, ...s, pings: (s?.pings ?? 0) + 1 }))
     try {
       await $.session.send({ to: { agentId: id }, text: PING_AGENT })
     } catch (err) {
@@ -347,24 +364,34 @@ async function rows($: EngineInterface, opts: Options): Promise<string[]> {
   if (l.contextPercent !== null) out.push(`Context: ${l.contextPercent}%`)
   out.push(`Thresholds: heads-up ${t.headsUp}% · subagents stop ${t.subagentsStop}% · main stop ${t.mainStop}% · weekly stop ${t.weekStop}%`)
 
+  const tgt = await warmTarget($)
+  const k = await read($, keep)
   if (m.lastCacheAt) {
     const age = now - m.lastCacheAt
-    const due =
-      p.kind === 'none'
-        ? 'no pings (not paused)'
-        : p.kind === 'quota' && !keepAliveWorth(p.until, now)
-          ? 'no pings: the pause ends too far off to keep the cache warm'
-          : (() => {
-              const plan = pingPlan(cacheWrittenAt(m.lastCacheAt, p.startedAt), p.until)
-              return plan ? `next ping in ${fmtDur(Math.max(0, plan.next - now))}` : 'no ping needed before the reset'
-            })()
+    const due = !tgt
+      ? 'keep warm off'
+      : p.kind === 'quota' && !keepAliveWorth(p.until, now)
+        ? 'no pings: the pause ends too far off to keep the cache warm'
+        : (() => {
+            const plan = pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
+            return plan ? `next ping in ${fmtDur(Math.max(0, plan.next - now))}` : 'no ping needed before the end'
+          })()
     out.push(`Main cache: ${fmtDur(age)} old; ${due}`)
   }
+  const st: CacheStats = { ...EMPTY_STATS, ...(await read($, stats)) }
+  const hr = hitRate(st.read, st.written, st.uncached)
+  out.push(
+    hr === null
+      ? 'Cache usage: no model calls yet'
+      : `Cache usage: ${fmtTok(cachedNow(st))} in cache · hit ${pct(hr * 100)} · miss ${pct((1 - hr) * 100)} · read ${fmtTok(st.read)} · written ${fmtTok(st.written)} · uncached ${fmtTok(st.uncached)} · ${st.calls} calls · ${st.rebuilds} rebuilds · ${st.pings} pings`,
+  )
   out.push('Overage: a mod cannot see it. If the session enters extra usage, the cache drops to 5 minutes.')
 
-  if (p.kind === 'none') out.push('Pause: none')
-  else if (p.kind === 'quota') out.push(`Paused for quota (${p.window}) until ${p.until ? fmtDur(p.until - now) : 'the reset'} from now; keep-alive on`)
-  else out.push(`Paused until ${p.until ? new Date(p.until).toLocaleTimeString() : '?'}; keep-alive on`)
+  if (p.kind === 'quota') out.push(`Paused for quota (${p.window}) until ${p.until ? fmtDur(p.until - now) : 'the reset'} from now; keep-alive on`)
+  else if (p.kind === 'time') out.push(`Paused until ${p.until ? new Date(p.until).toLocaleTimeString() : '?'}; keep-alive on`)
+  else if (k.choice === 'always') out.push('Keep warm: always on, until you turn it off')
+  else if (tgt) out.push(`Keep warm: until ${tgt.until ? new Date(tgt.until).toLocaleTimeString() : 'the reset'}`)
+  else out.push('Keep warm: off')
 
   const agentList = await $.agent.list()
   const seen = agentList.slice(0, MAX_ROWS)
@@ -425,11 +452,11 @@ async function simulateOff($: EngineInterface): Promise<string> {
 
 // Settings the person changes in the panel; kept in $.store so they outlast the session.
 const STORE_KEY = 'settings'
-type Saved = { thresholds: Partial<Thresholds> }
+type Saved = { thresholds: Partial<Thresholds>; defaultKeep?: 'off' | 'always' }
 
 async function saveSettings($: EngineInterface): Promise<void> {
   const ov = await read($, overrides)
-  const saved: Saved = { thresholds: ov.thresholds }
+  const saved: Saved = { thresholds: ov.thresholds, defaultKeep: ov.defaultKeep ?? 'off' }
   try {
     await $.store.set(STORE_KEY, saved)
   } catch (err) {
@@ -452,8 +479,30 @@ async function loadSettings($: EngineInterface): Promise<void> {
     const v = raw.thresholds?.[k]
     if (typeof v === 'number' && v >= 1 && v <= 100) thresholds[k] = v
   }
-  await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: null }))
+  const defaultKeep: 'off' | 'always' = raw.defaultKeep === 'always' ? 'always' : 'off'
+  await update($, overrides, prev => ({ ...prev, thresholds, pingMinutes: null, defaultKeep }))
+}
 
+// Once per session (not on a reload): a new chat starts with the keep warm the person chose for every chat.
+async function applyDefaultKeep($: EngineInterface): Promise<void> {
+  const w = await read($, warm)
+  if (w.defaultApplied) return
+  await update($, warm, prev => ({ ...prev, defaultApplied: true }))
+  const ov = await read($, overrides)
+  if (ov.defaultKeep !== 'always') return
+  const k = await read($, keep)
+  const p = await read($, pause)
+  if (k.choice === 'off' && p.kind === 'none') await setKeep($, 'always')
+}
+
+async function setDefaultKeep($: EngineInterface, value: 'off' | 'always'): Promise<string> {
+  await update($, overrides, prev => ({ ...prev, defaultKeep: value }))
+  await saveSettings($)
+  if (value === 'off') return 'New chats start with keep warm off.'
+  const k = await read($, keep)
+  const p = await read($, pause)
+  if (k.choice === 'off' && p.kind === 'none') await setKeep($, 'always')
+  return 'Every chat now keeps its cache warm until you turn it off, this one included.'
 }
 
 const THRESHOLD_NAMES: Record<keyof Thresholds, string> = {
@@ -498,11 +547,15 @@ async function setKeep($: EngineInterface, choice: KeepState['choice']): Promise
     await update($, keep, () => NO_KEEP)
     return p.kind === 'none' ? 'Not keeping the cache warm.' : continueNow($)
   }
+  if (choice === 'always') {
+    await update($, keep, () => ({ choice, until: null, startedAt: now, lastPingAt: 0 }))
+    return 'Keeping the cache warm until you turn it off.'
+  }
   const q = await read($, quota)
   const reset = q.limits?.fiveHour?.resetsAt ?? null
   if (choice === 'reset' && (reset === null || reset <= now)) return 'The 5-hour reset time is not known yet.'
   const until = choice === 'reset' ? reset! : now + Number(choice) * HOUR
-  await update($, keep, () => ({ choice, until: choice === 'reset' ? null : until, startedAt: now, lastPingAt: 0 }))
+  await update($, keep, () => ({ choice, until, startedAt: now, lastPingAt: 0 }))
   // A pause the person set follows the new end; a limit's pause keeps waiting on its reset.
   if (p.kind === 'time') await update($, pause, prev => ({ ...prev, until }))
   return `Keeping the cache warm until ${new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`
@@ -515,7 +568,7 @@ async function pauseWork($: EngineInterface): Promise<string> {
 }
 
 async function resetSettings($: EngineInterface): Promise<string> {
-  await update($, overrides, prev => ({ ...prev, thresholds: {}, pingMinutes: null }))
+  await update($, overrides, prev => ({ ...prev, thresholds: {}, pingMinutes: null, defaultKeep: 'off' as const }))
   await update($, quota, prev => ({ ...prev, said: [] }))
   await saveSettings($)
   return 'Settings back to the defaults.'
@@ -544,9 +597,10 @@ export const register: Register = (on, options) => {
     const started = await next(e)
     await $.command.register({
       name: 'quota',
-      description: 'Quota mod: opens the Quota panel, where every control and setting lives. Typed forms still work: pause until HH:MM, continue, threshold, simulate, model',
+      description: 'Quota mod: opens the Quota panel, where every control and setting lives. Typed forms still work: keep <off|1|2|4|reset|always>, pause until HH:MM, continue, threshold, simulate, model',
     })
     await loadSettings($)
+    await applyDefaultKeep($)
     void $.ui.open({ id: PANE, title: 'Quota' })
     await tick($, opts)
     $.clock.every(TICK_MS, () => {
@@ -556,7 +610,8 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined) await update($, warm, prev => ({ ...prev, busy: true }))
+    // A main turn our ping started is tagged, so its tokens count as the ping's.
+    if (e.agentId === undefined) await update($, warm, prev => ({ ...prev, busy: true, pingTurn: e.text.trim() === PING_MAIN ? e.turnId : '' }))
     return next(e)
   })
 
@@ -569,6 +624,8 @@ export const register: Register = (on, options) => {
     const model = usage.model || e.model
     const cached = (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0) > 0
     const tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0)
+    const isPing = !e.agentId && (await read($, warm)).pingTurn === e.turnId
+    await update($, stats, prev => addUsage(prev, usage, now, { agent: Boolean(e.agentId), ping: isPing }))
     if (!e.agentId) {
       const recache =
         (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0) + (usage.output_tokens || 0)
@@ -629,6 +686,13 @@ export const register: Register = (on, options) => {
 
     if (verb === 'continue') return { text: await continueNow($) }
 
+    if (verb === 'keep') {
+      const choices: Record<string, KeepState['choice']> = { off: 'off', '1': '1', '1h': '1', '2': '2', '2h': '2', '4': '4', '4h': '4', reset: 'reset', always: 'always', on: 'always' }
+      const choice = choices[a]
+      if (!choice) return { text: 'Use: /quota keep <off|1h|2h|4h|reset|always>' }
+      return { text: await setKeep($, choice) }
+    }
+
     if (verb === 'threshold') {
       const names: Record<string, keyof Thresholds> = { 'heads-up': 'headsUp', subagents: 'subagentsStop', main: 'mainStop', week: 'weekStop' }
       const key = names[a]
@@ -645,17 +709,19 @@ export const register: Register = (on, options) => {
 
     if (verb === 'model') return { text: await setModelPercent($, a) }
 
-    return { text: 'Quota commands: show · pause until HH:MM · continue · threshold · simulate · model' }
+    return { text: 'Quota commands: show · keep <off|1h|2h|4h|reset|always> · pause until HH:MM · continue · threshold · simulate · model' }
   })
 
-  // The pane: one card per limit, then the cache and pause card, subagents, and a footer.
-  // Desktop and phone draw rings and bars as SVG; the terminal draws block characters.
-  // Every command works from the pane's own controls, with no /quota typed.
+  // The side panel. Two pages, picked by the tabs at the top: Overview (the cache and keep
+  // warm, cache usage, plan limits, subagents) and Settings. Desktop and phone draw rings and
+  // bars as SVG; the terminal draws block characters. A minimized desktop pane (the widget)
+  // gets a glance with no controls. Every control is a click; nothing needs typing.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Select } = $.ui.resolve(e)
     const isRich = e.surface !== 'terminal' && e.surface !== 'vscode'
     const Svg = isRich ? $.ui.resolve(e).Svg : null
     const cols = e.props.bodyColumns
+    const gapY = isRich ? 1 : 0
 
     const now = await $.clock.now()
     const q = await read($, quota)
@@ -664,7 +730,13 @@ export const register: Register = (on, options) => {
     const m = await read($, main)
     const map = await read($, agents)
     const note = await read($, said)
+    const k = await read($, keep)
+    const st: CacheStats = { ...EMPTY_STATS, ...(await read($, stats)) }
+    const busy = (await read($, warm)).busy
+    const tgt = await warmTarget($)
+    const onSettings = await read($, settingsOpen)
     const t = thresholdsOf(opts, ov)
+    const l = q.limits
 
     const act = (work: () => Promise<string>) => {
       void work().then(
@@ -672,14 +744,18 @@ export const register: Register = (on, options) => {
         err => update($, said, () => `Failed: ${(err as Error).message}`),
       )
     }
+    const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 
+    // A figure and its label: bold value, dim label.
     const stat = (value: string, label: string, tone?: Tone) =>
       isRich ? (
         <Box key={label} gap={1} alignItems="center">
-          <Text bold color={tone}>
+          <Text bold tabular color={tone}>
             {value}
           </Text>
-          <Text dimColor>{label}</Text>
+          <Text dimColor size="footnote">
+            {label}
+          </Text>
         </Box>
       ) : (
         <Box key={label} gap={1}>
@@ -690,13 +766,28 @@ export const register: Register = (on, options) => {
         </Box>
       )
 
+    // A big figure over its label, for the cache usage row.
+    const figure = (value: string, label: string, tone?: Tone) =>
+      isRich ? (
+        <Box key={label} flexDirection="column" minWidth={72}>
+          <Text bold tabular size="heading" color={tone}>
+            {value}
+          </Text>
+          <Text dimColor size="caption">
+            {label}
+          </Text>
+        </Box>
+      ) : (
+        stat(value, label, tone)
+      )
+
     const ring = (share: number, tone: Tone, alt: string) =>
       Svg ? <Svg source={ringSvg(share, tone)} alt={alt} width={18} height={18} /> : <Text color={tone}>{share > 0 ? '●' : '○'}</Text>
 
-    // A usage bar: SVG with threshold marks on desktop, blocks sized to the pane in the terminal.
+    // A bar: SVG (with threshold marks) on desktop, blocks sized to the pane in the terminal.
     const bar = (percent: number, tone: Tone, marks: number[], alt: string) => {
       if (Svg) return <Svg source={barSvg(percent, tone, marks)} alt={alt} />
-      const b = blocks(percent / 100, Math.max(10, Math.min(40, cols - 16)))
+      const b = blocks(percent / 100, Math.max(10, Math.min(40, cols - 8)))
       return (
         <Text>
           <Text color={tone}>{b.filled}</Text>
@@ -705,85 +796,98 @@ export const register: Register = (on, options) => {
       )
     }
 
-    // A row of one-click choices; the current one is drawn as the primary button.
-    const chips = (prefix: string, values: number[], current: number | null, fmt: (v: number) => string, pick: (v: number) => Promise<string>) => (
-      <Box gap={1} flexWrap="wrap" alignItems="center">
-        {values.map(v => (
-          <Button key={`${prefix}-${v}`} label={fmt(v)} variant={v === current ? 'primary' : 'secondary'} onPress={() => act(() => pick(v))} />
-        ))}
-      </Box>
-    )
-
-    const modelPicker = (value: string) => (
-      <Select
-        key="model-week"
-        label="Usage card says"
-        value={value}
-        // A Select holds at most 64 options: every 2%, plus the current value when it is odd.
-        options={[
-          { value: 'off', label: 'not set' },
-          ...withCurrent(
-            Array.from({ length: 51 }, (_, i) => i * 2),
-            value === 'off' ? 0 : Number(value),
-          ).map(i => ({ value: String(i), label: `${i}%` })),
-        ]}
-        onSelect={v => act(() => setModelPercent($, v))}
-      />
-    )
-
     const card = (key: string, tone: Tone | null, children: RenderChildren) => (
-      <Box key={key} flexDirection="column" borderStyle="round" borderDimColor={tone === null || tone === 'success'} borderColor={tone && tone !== 'success' ? tone : undefined} paddingX={1} marginBottom={1}>
+      <Box
+        key={key}
+        flexDirection="column"
+        borderStyle="round"
+        borderDimColor={tone === null || tone === 'success'}
+        borderColor={tone && tone !== 'success' ? tone : undefined}
+        paddingX={1}
+        paddingY={isRich ? 1 : 0}
+        marginBottom={1}
+        gap={gapY}
+      >
         {children}
       </Box>
     )
 
-    // One limit: name and percent, the bar, then reset, pace and outlook.
-    const windowCard = (key: 'fiveHour' | 'weekAll', win: QuotaWindow, stopAt: number) => {
-      const tone = toneOf(win.percent, t.headsUp, stopAt)
-      const pace = paceOf(q.samples, key, now)
-      const o = outlookOf(win, pace, now)
-      const marks = key === 'fiveHour' ? [t.headsUp, t.subagentsStop, t.mainStop] : [t.headsUp, t.weekStop]
-      const outlook =
-        o.hoursToFull === null ? 'pace needs more readings' : o.lastsToReset ? 'lasts to the reset' : `runs out in ${fmtDur(o.hoursToFull * HOUR)}`
-      return card(
-        key,
-        tone,
-        <>
-          <Box justifyContent="space-between" alignItems="center" gap={2}>
-            <Box gap={1} alignItems="center" flexShrink={1}>
-              {ring(win.percent / 100, tone, `${win.label}: ${pct(win.percent)} used`)}
-              <Text bold>{win.label}</Text>
-            </Box>
-            <Box gap={1} alignItems="center" flexShrink={0}>
-              <Text bold color={tone}>
-                {pct(win.percent)}
-              </Text>
-              <Text dimColor>used</Text>
-            </Box>
-          </Box>
-          <Box marginY={isRich ? 1 : 0}>{bar(win.percent, tone, marks, `${pct(win.percent)} of ${win.label}`)}</Box>
-          <Box gap={isRich ? 3 : 2} flexWrap="wrap">
-            {stat(win.resetsAt ? fmtDur(win.resetsAt - now) : '?', 'to reset')}
-            {stat(pace === null ? '…' : `${pace.toFixed(key === 'fiveHour' ? 1 : 2)}%/h`, 'pace')}
-            <Text dimColor color={o.lastsToReset === false ? 'warning' : undefined}>
-              {outlook}
+    const heading = (title: string, right?: RenderChildren) => (
+      <Box key={`h-${title}`} justifyContent="space-between" alignItems="center" gap={2}>
+        <Text bold size={isRich ? 'body' : undefined} weight={isRich ? 'semibold' : undefined}>
+          {title}
+        </Text>
+        {right ?? null}
+      </Box>
+    )
+
+    // The cache: its lifetime (5 minutes once a limit is spent and extra usage may be in play).
+    const ttl = l && windowsOf(l).some(w => w.win.percent >= 100) ? 5 * MINUTE : HOUR
+    const cacheLeft = m.lastCacheAt ? m.lastCacheAt + ttl - now : null
+    const share = cacheLeft === null ? 0 : Math.max(0, cacheLeft / ttl)
+    const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
+    const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
+    const spent = spentNow(q)
+    const plan = !tgt || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
+    const chosen: KeepState['choice'] = p.kind === 'quota' ? 'reset' : k.choice
+    const hit = hitRate(st.read, st.written, st.uncached)
+    const inCache = cachedNow(st)
+    const leftShort = cacheLeft === null ? '—' : cacheLeft > 0 ? (cacheLeft >= HOUR ? '60m' : `${Math.max(1, Math.ceil(cacheLeft / MINUTE))}m`) : 'cold'
+
+    const statusText =
+      p.kind === 'quota'
+        ? `Work paused by the ${p.window}${p.until ? ` until ${clockAt(p.until)}` : ''}`
+        : p.kind === 'time'
+          ? `Work paused until ${p.until ? clockAt(p.until) : '?'}`
+          : !tgt
+            ? 'Not keeping warm'
+            : k.choice === 'always'
+              ? 'Keeping warm · always on'
+              : `Keeping warm until ${tgt.until ? clockAt(tgt.until) : 'the reset'}`
+    const statusTone: Tone | undefined = p.kind !== 'none' ? 'warning' : tgt ? 'success' : undefined
+
+    // The minimized desktop pane: a glance, no controls (clicks may not reach it).
+    if (e.props.placement === 'widget') {
+      const five = l?.fiveHour
+      return (
+        <Box flexDirection="column" gap={1} paddingX={1}>
+          <Box gap={1} alignItems="center">
+            {ring(share, cTone, cacheLeft === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${leftShort} left`)}
+            <Text bold color={cTone}>
+              {cacheLeft === null ? 'No reply yet' : cacheLeft > 0 ? `${leftShort} left` : 'Cache cold'}
             </Text>
           </Box>
-        </>,
+          <Text dimColor size="footnote">
+            {[tgt ? (k.choice === 'always' && p.kind === 'none' ? 'Warm ∞' : p.kind !== 'none' ? 'Paused' : 'Warm') : 'Keep warm off', hit === null ? '' : `${pct(hit * 100)} hit`, five ? `5h ${pct(five.percent)}` : '']
+              .filter(Boolean)
+              .join(' · ')}
+          </Text>
+        </Box>
       )
     }
 
-    const l = q.limits
     const parts: RenderChildren[] = []
+
+    // Tabs: the two pages.
+    parts.push(
+      <Box key="tabs" gap={1} alignItems="center" marginBottom={1}>
+        <Button key="tab-overview" label="Overview" variant={onSettings ? 'secondary' : 'primary'} onPress={() => void update($, settingsOpen, () => false)} />
+        <Button key="tab-settings" label="Settings" variant={onSettings ? 'primary' : 'secondary'} onPress={() => void update($, settingsOpen, () => true)} />
+        <Box flexGrow={1} />
+        <Button key="refresh" label="Refresh" dimColor onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
+      </Box>,
+    )
 
     if (ov.simulate)
       parts.push(
-        <Box key="sim" gap={1} alignItems="center" marginBottom={1}>
+        <Box key="sim" gap={1} alignItems="center" marginBottom={1} flexWrap="wrap">
           <Text bold color="warning">
-            Simulated
+            Test mode
           </Text>
-          <Text dimColor>test values, thresholds fire from them</Text>
-          <Button key="sim-off" label="End" onPress={() => act(() => simulateOff($))} />
+          <Text dimColor>
+            5-hour {ov.simulate.fiveHour}%, weekly {ov.simulate.week}% (made up)
+          </Text>
+          <Button key="sim-off" label="End test" onPress={() => act(() => simulateOff($))} />
         </Box>,
       )
     if (q.unavailable)
@@ -792,269 +896,369 @@ export const register: Register = (on, options) => {
           {q.unavailable}
         </Text>,
       )
+    // Feedback from the last press, at the top where it is seen.
+    if (note)
+      parts.push(
+        <Box key="note" marginBottom={1}>
+          <Text color={note.startsWith('Failed') || note.startsWith('Use') || note.startsWith('The 5-hour reset') || note.startsWith('Pick') ? 'error' : 'success'}>{note}</Text>
+        </Box>,
+      )
 
-    if (!l) parts.push(<Text key="reading" dimColor>Reading the limits…</Text>)
-    else {
-      if (l.fiveHour) parts.push(windowCard('fiveHour', l.fiveHour, t.mainStop))
-      if (l.weekAll) parts.push(windowCard('weekAll', l.weekAll, t.weekStop))
+    if (!onSettings) {
+      // 1. The prompt cache and keep warm: the panel's main job.
+      const keepChip = (choice: KeepState['choice'], label: string) => (
+        <Button
+          key={`keep-${choice}`}
+          label={label}
+          variant={(choice === 'off' ? chosen === 'off' && p.kind === 'none' : chosen === choice) ? 'primary' : 'secondary'}
+          onPress={() => act(() => setKeep($, choice))}
+        />
+      )
+      const planLine: RenderChildren = !tgt ? (
+        <Text key="plan" dimColor>
+          Pick how long to keep the cache warm while you are away.
+        </Text>
+      ) : spent ? (
+        <Text key="plan" dimColor>
+          No pings: the limit is at 100%, requests are refused.
+        </Text>
+      ) : farOff ? (
+        <Text key="plan" dimColor>
+          No pings: the reset is too far off to be worth it.
+        </Text>
+      ) : busy ? (
+        <Text key="plan" dimColor>
+          A turn is running; it keeps the cache warm.
+        </Text>
+      ) : plan === null ? (
+        <Text key="plan" dimColor>
+          No ping needed: the cache lasts until then.
+        </Text>
+      ) : (
+        <Box key="plan" gap={isRich ? 3 : 2} flexWrap="wrap">
+          {stat(fmtDur(Math.max(0, plan.next - now)), 'to next ping', statusTone)}
+          {plan.left !== null ? stat(String(plan.left), plan.left === 1 ? 'ping left' : 'pings left') : stat('∞', 'until you stop')}
+          {stat(`${Math.round(plan.gap / MINUTE)}m`, 'apart')}
+        </Box>
+      )
+      const hint =
+        k.choice === 'always' && p.kind === 'none'
+          ? 'A one-word ping every 50 minutes of idle, until you press Off. Your own messages count too.'
+          : 'Pings go out evenly to the end, at most 50 minutes apart. Your own messages count, so it only pings while you are away.'
 
-      // The main model's weekly window: the mod cannot read it, so it is typed in.
-      const wm = l.weekModel
-      const modelName = m.model || 'main model'
-      if (wm) {
-        const tone = toneOf(wm.percent, t.headsUp, t.weekStop)
-        parts.push(
-          card(
-            'weekModel',
-            tone,
-            <>
-              <Box justifyContent="space-between" alignItems="center" gap={2}>
-                <Box gap={1} alignItems="center" flexShrink={1}>
-                  {ring(wm.percent / 100, tone, `${wm.label}: ${pct(wm.percent)} used`)}
-                  <Text bold>Weekly · {modelName}</Text>
-                </Box>
-                <Box gap={1} alignItems="center" flexShrink={0}>
-                  <Text bold color={tone}>
-                    {pct(wm.percent)}
-                  </Text>
-                  <Text dimColor>set by hand</Text>
-                </Box>
-              </Box>
-              <Box marginY={isRich ? 1 : 0}>{bar(wm.percent, tone, [t.headsUp, t.weekStop], `${pct(wm.percent)} of ${wm.label}`)}</Box>
-              {modelPicker(String(wm.percent))}
-            </>,
-          ),
-        )
-      } else {
-        parts.push(
-          card(
-            'weekModel',
-            null,
-            <>
-              <Box gap={1} alignItems="center">
-                {ring(0, 'success', `Weekly ${modelName}: not set`)}
-                <Text bold>Weekly · {modelName}</Text>
-              </Box>
-              <Text dimColor>A mod cannot read this one. Pick the number the usage card shows.</Text>
-              {modelPicker('off')}
-            </>,
-          ),
-        )
-      }
-    }
-
-    // Cache and pause: how long the main cache has, and what the keep-alive is doing.
-    const ttl = l && windowsOf(l).some(w => w.win.percent >= 100) ? 5 * MINUTE : HOUR
-    const cacheLeft = m.lastCacheAt ? m.lastCacheAt + ttl - now : null
-    const share = cacheLeft === null ? 0 : Math.max(0, cacheLeft / ttl)
-    const cTone: Tone = cacheLeft === null ? 'success' : cacheTone(share)
-    const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
-    const spent = spentNow(q)
-    const k = await read($, keep)
-    const tgt = await warmTarget($)
-    const busy = (await read($, warm)).busy
-    const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    const plan = !tgt || farOff || spent ? null : pingPlan(cacheWrittenAt(m.lastCacheAt, tgt.startedAt), tgt.until)
-    const chosen: KeepState['choice'] = p.kind === 'quota' ? 'reset' : k.choice
-    const statusText =
-      p.kind === 'quota'
-        ? `Work paused by the ${p.window}${p.until ? ` until ${clockAt(p.until)}` : ''}`
-        : p.kind === 'time'
-          ? `Work paused until ${p.until ? clockAt(p.until) : '?'}`
-          : tgt
-            ? `Keeping warm until ${tgt.until ? clockAt(tgt.until) : 'the reset'}`
-            : 'Not keeping warm'
-    const statusTone = p.kind !== 'none' ? 'warning' : tgt ? 'success' : undefined
-
-    parts.push(
-      card(
-        'cache',
-        p.kind === 'none' ? (cacheLeft === null ? null : cTone) : 'warning',
-        <>
-          <Box justifyContent="space-between" alignItems="center" gap={2}>
-            <Box gap={1} alignItems="center" flexShrink={1}>
-              {ring(share, cTone, cacheLeft === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${fmtDur(Math.max(0, cacheLeft))} left`)}
-              <Text bold>Prompt cache</Text>
-            </Box>
-            <Box gap={1} alignItems="center" flexShrink={0}>
-              {cacheLeft === null ? (
-                <Text dimColor>no reply yet</Text>
-              ) : cacheLeft > 0 ? (
-                <>
-                  <Text bold color={cTone}>
-                    {fmtDur(cacheLeft)} left
-                  </Text>
-                  <Text dimColor>of {ttl === HOUR ? '60m' : '5m'}</Text>
-                </>
-              ) : (
-                <Text bold color="error">
-                  Expired
-                </Text>
-              )}
-            </Box>
-          </Box>
-          <Box gap={isRich ? 3 : 2} flexWrap="wrap" marginTop={isRich ? 1 : 0}>
-            <Text bold color={statusTone}>
-              {statusText}
-            </Text>
-            {!tgt ? null : spent ? (
-              <Text dimColor>no pings: the limit is at 100%, requests are refused</Text>
-            ) : farOff ? (
-              <Text dimColor>no pings: the reset is too far off</Text>
-            ) : busy ? (
-              <Text dimColor>a turn is running; it keeps the cache warm</Text>
-            ) : plan === null ? (
-              <Text dimColor>no ping needed: the cache lasts until then</Text>
-            ) : (
-              <>
-                {stat(fmtDur(Math.max(0, plan.next - now)), 'to next ping', statusTone)}
-                {plan.left !== null ? stat(String(plan.left), plan.left === 1 ? 'ping left' : 'pings left') : null}
-                {stat(`${Math.round(plan.gap / MINUTE)}m`, 'apart')}
-              </>
-            )}
-          </Box>
-          <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
-            <Text dimColor>Keep warm</Text>
-            <Button key="keep-off" label="Off" variant={chosen === 'off' && p.kind === 'none' ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, 'off'))} />
-            {KEEP_HOURS.map(hours => (
-              <Button key={`keep-${hours}`} label={`${hours}h`} variant={chosen === String(hours) ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, String(hours) as KeepState['choice']))} />
-            ))}
-            {l?.fiveHour?.resetsAt && l.fiveHour.resetsAt > now ? (
-              <Button key="keep-reset" label="Until reset" variant={chosen === 'reset' ? 'primary' : 'secondary'} onPress={() => act(() => setKeep($, 'reset'))} />
-            ) : null}
-          </Box>
-          <Box gap={1} alignItems="center" marginTop={isRich ? 1 : 0} flexWrap="wrap">
-            {p.kind !== 'none' ? (
-              <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} />
-            ) : tgt ? (
-              <Button key="pause-work" label="Pause work until then" onPress={() => act(() => pauseWork($))} />
-            ) : null}
-          </Box>
-          <Text dimColor>
-            Pings go out evenly up to the end, at most 50 minutes apart, so the 60-minute cache is still warm then. Your own replies count, so it only pings while you're away. A limit's stop level turns it on by itself, with work paused until the reset.
+      const timeLeft: RenderChildren =
+        cacheLeft === null ? (
+          <Text key="left" dimColor>
+            No reply yet
           </Text>
-        </>,
-      ),
-    )
+        ) : cacheLeft > 0 ? (
+          <Box key="left" gap={1} alignItems="center">
+            <Text bold tabular color={cTone} size={isRich ? 'title' : undefined}>
+              {fmtDur(cacheLeft)}
+            </Text>
+            <Text dimColor>left of {ttl === HOUR ? '60m' : '5m'}</Text>
+          </Box>
+        ) : (
+          <Text key="left" bold color="error" size={isRich ? 'title' : undefined}>
+            Expired
+          </Text>
+        )
 
-    // Subagents, one row each, only when there are any.
-    const agentList = (await $.agent.list()).slice(0, MAX_ROWS)
-    if (agentList.length > 0)
+      parts.push(
+        card('cache', p.kind === 'none' ? (cacheLeft === null ? null : cTone === 'success' ? null : cTone) : 'warning', [
+          <Box key="hero" gap={2} alignItems="center">
+            {Svg ? (
+              <Svg
+                key="hero-ring"
+                source={heroRingSvg(share, cacheLeft !== null && cacheLeft <= 0 ? 'error' : cTone, leftShort, cacheLeft !== null && cacheLeft > 0 ? 'left' : '')}
+                alt={cacheLeft === null ? 'Prompt cache: no reply yet' : `Prompt cache: ${fmtDur(Math.max(0, cacheLeft))} left`}
+                width={64}
+                height={64}
+              />
+            ) : (
+              ring(share, cTone, 'Prompt cache')
+            )}
+            <Box flexDirection="column" flexShrink={1}>
+              <Text bold>Prompt cache</Text>
+              {timeLeft}
+              <Text key="status" bold color={statusTone}>
+                {statusText}
+              </Text>
+            </Box>
+          </Box>,
+          planLine,
+          <Box key="keep" flexDirection="column" gap={isRich ? 1 : 0}>
+            <Text dimColor size="footnote">
+              Keep warm
+            </Text>
+            <Box gap={1} alignItems="center" flexWrap="wrap">
+              {keepChip('off', 'Off')}
+              {KEEP_HOURS.map(hours => keepChip(String(hours) as KeepState['choice'], `${hours}h`))}
+              {l?.fiveHour?.resetsAt && l.fiveHour.resetsAt > now ? keepChip('reset', 'Until reset') : null}
+              {keepChip('always', 'Always')}
+            </Box>
+          </Box>,
+          p.kind !== 'none' ? (
+            <Box key="actions" gap={1}>
+              <Button key="continue" variant="primary" label="Continue now" onPress={() => act(() => continueNow($))} />
+            </Box>
+          ) : tgt && tgt.until !== null ? (
+            <Box key="actions" gap={1}>
+              <Button key="pause-work" label={`Pause work until ${clockAt(tgt.until)}`} onPress={() => act(() => pauseWork($))} />
+            </Box>
+          ) : null,
+          <Text key="hint" dimColor size="footnote">
+            {hint}
+          </Text>,
+        ]),
+      )
+
+      // 2. Cache usage: what is cached now, the hit and miss rates, and the session's totals.
+      const missTone: Tone | undefined = hit === null ? undefined : hitTone(hit) === 'success' ? undefined : hitTone(hit)
+      const agentHit = hitRate(st.agentRead, st.agentWritten, st.agentUncached)
       parts.push(
         card(
-          'agents',
+          'usage',
           null,
-          <>
-            <Text bold>Subagents</Text>
-            {agentList.map(a => {
+          st.calls === 0
+            ? [heading('Cache usage'), <Text key="none" dimColor>No model calls in this chat yet.</Text>]
+            : [
+                heading('Cache usage', <Text dimColor size="footnote">{`${st.calls} ${st.calls === 1 ? 'call' : 'calls'}`}</Text>),
+                <Box key="figures" gap={isRich ? 3 : 2} flexWrap="wrap">
+                  {figure(fmtTok(inCache), 'in cache')}
+                  {figure(hit === null ? '…' : pct(hit * 100), 'hit rate', hit === null ? undefined : hitTone(hit))}
+                  {figure(hit === null ? '…' : pct((1 - hit) * 100), 'miss rate', missTone)}
+                </Box>,
+                hit === null ? null : <Box key="hitbar">{bar(hit * 100, hitTone(hit), [], `Cache hit rate ${pct(hit * 100)}`)}</Box>,
+                <Box key="totals" gap={isRich ? 3 : 2} flexWrap="wrap">
+                  {stat(fmtTok(st.read), 'read')}
+                  {stat(fmtTok(st.written), 'written')}
+                  {stat(fmtTok(st.uncached), 'uncached')}
+                  {stat(fmtTok(st.output), 'output')}
+                </Box>,
+                <Box key="events" gap={isRich ? 3 : 2} flexWrap="wrap">
+                  {stat(String(st.rebuilds), st.lastRebuildAt ? `${st.rebuilds === 1 ? 'rebuild' : 'rebuilds'}, last ${clockAt(st.lastRebuildAt)}` : 'rebuilds')}
+                  {stat(String(st.pings), st.pings === 1 ? 'ping' : 'pings')}
+                  {st.pingRead + st.pingWritten > 0 ? stat(fmtTok(st.pingRead + st.pingWritten), 'ping tokens') : null}
+                </Box>,
+                st.agentCalls > 0 ? (
+                  <Text key="agents-usage" dimColor size="footnote">
+                    Subagents: {st.agentCalls} calls · {agentHit === null ? '…' : `${pct(agentHit * 100)} hit`} · {fmtTok(st.agentRead)} read · {fmtTok(st.agentWritten)} written
+                  </Text>
+                ) : null,
+              ],
+        ),
+      )
+
+      // 3. Plan limits, in one card: 5-hour, weekly, the main model's weekly (set by hand), context.
+      const limitRow = (key: 'fiveHour' | 'weekAll', win: QuotaWindow, stopAt: number) => {
+        const tone = toneOf(win.percent, t.headsUp, stopAt)
+        const pace = paceOf(q.samples, key, now)
+        const o = outlookOf(win, pace, now)
+        const marks = key === 'fiveHour' ? [t.headsUp, t.subagentsStop, t.mainStop] : [t.headsUp, t.weekStop]
+        const outlook = o.hoursToFull === null ? 'pace needs more readings' : o.lastsToReset ? 'lasts to the reset' : `runs out in ${fmtDur(o.hoursToFull * HOUR)}`
+        return (
+          <Box key={key} flexDirection="column">
+            <Box justifyContent="space-between" alignItems="center" gap={2}>
+              <Box gap={1} alignItems="center" flexShrink={1}>
+                {ring(win.percent / 100, tone, `${win.label}: ${pct(win.percent)} used`)}
+                <Text bold>{win.label}</Text>
+              </Box>
+              <Text bold tabular color={tone}>
+                {pct(win.percent)}
+              </Text>
+            </Box>
+            <Box marginY={isRich ? 1 : 0}>{bar(win.percent, tone, marks, `${pct(win.percent)} of ${win.label}`)}</Box>
+            <Box gap={isRich ? 3 : 2} flexWrap="wrap">
+              {stat(win.resetsAt ? fmtDur(win.resetsAt - now) : '?', 'to reset')}
+              {stat(pace === null ? '…' : `${pace.toFixed(key === 'fiveHour' ? 1 : 2)}%/h`, 'pace')}
+              <Text dimColor size="footnote" color={o.lastsToReset === false ? 'warning' : undefined}>
+                {outlook}
+              </Text>
+            </Box>
+          </Box>
+        )
+      }
+      const modelPicker = (value: string) => (
+        <Select
+          key="model-week"
+          label="Usage card says"
+          value={value}
+          // A Select holds at most 64 options: every 2%, plus the current value when it is odd.
+          options={[
+            { value: 'off', label: 'not set' },
+            ...withCurrent(
+              Array.from({ length: 51 }, (_, i) => i * 2),
+              value === 'off' ? 0 : Number(value),
+            ).map(i => ({ value: String(i), label: `${i}%` })),
+          ]}
+          onSelect={v => act(() => setModelPercent($, v))}
+        />
+      )
+
+      if (!l) parts.push(card('limits', null, [heading('Plan limits'), <Text key="reading" dimColor>Reading the limits…</Text>]))
+      else {
+        const tones = windowsOf(l).map(({ key, win }) => toneOf(win.percent, t.headsUp, key === 'fiveHour' ? t.mainStop : t.weekStop))
+        const worst: Tone | null = tones.includes('error') ? 'error' : tones.includes('warning') ? 'warning' : null
+        const wm = l.weekModel
+        const modelName = m.model || 'main model'
+        const wmTone = wm ? toneOf(wm.percent, t.headsUp, t.weekStop) : 'success'
+        parts.push(
+          card('limits', worst, [
+            heading('Plan limits', l.contextPercent !== null ? stat(`${l.contextPercent}%`, 'context') : null),
+            l.fiveHour ? limitRow('fiveHour', l.fiveHour, t.mainStop) : <Text key="no-five" dimColor>5-hour limit: not reported</Text>,
+            l.weekAll ? limitRow('weekAll', l.weekAll, t.weekStop) : <Text key="no-week" dimColor>Weekly · all models: not reported</Text>,
+            <Box key="weekModel" flexDirection="column">
+              <Box justifyContent="space-between" alignItems="center" gap={2}>
+                <Box gap={1} alignItems="center" flexShrink={1}>
+                  {ring(wm ? wm.percent / 100 : 0, wmTone, `Weekly ${modelName}: ${wm ? pct(wm.percent) : 'not set'}`)}
+                  <Text bold>Weekly · {modelName}</Text>
+                </Box>
+                {wm ? (
+                  <Text bold tabular color={wmTone}>
+                    {pct(wm.percent)}
+                  </Text>
+                ) : (
+                  <Text dimColor>not set</Text>
+                )}
+              </Box>
+              {wm ? <Box marginY={isRich ? 1 : 0}>{bar(wm.percent, wmTone, [t.headsUp, t.weekStop], `${pct(wm.percent)} of ${wm.label}`)}</Box> : null}
+              {wm ? null : (
+                <Text dimColor size="footnote">
+                  A mod cannot read this one: pick what the usage card shows.
+                </Text>
+              )}
+              {modelPicker(wm ? String(wm.percent) : 'off')}
+            </Box>,
+          ]),
+        )
+      }
+
+      // 4. Subagents, one row each, only when there are any.
+      const agentList = (await $.agent.list()).slice(0, MAX_ROWS)
+      if (agentList.length > 0)
+        parts.push(
+          card('agents', null, [
+            heading('Subagents'),
+            ...agentList.map(a => {
               const s = map[a.id]
               const paused = s?.status === 'paused'
               const window = s && m.model ? (spendsWindow(s.model, m.model) === 'model' ? 'model window' : 'all-models') : ''
               return (
-                <Box key={a.id} gap={2} flexWrap="wrap">
+                <Box key={a.id} flexDirection="column">
                   <Text color={paused ? 'warning' : undefined}>
                     {paused ? '❚❚' : a.status === 'running' ? '●' : '○'} {a.description || a.type}
                   </Text>
-                  <Text dimColor>
-                    {[s?.model ?? '', paused ? 'paused for quota' : a.status, `${s?.tokens ?? 0} tok`, s?.lastCacheAt ? `cache ${fmtDur(now - s.lastCacheAt)} old` : '', window].filter(Boolean).join(' · ')}
+                  <Text dimColor size="footnote">
+                    {[s?.model ?? '', paused ? 'paused for quota' : a.status, `${fmtTok(s?.tokens ?? 0)} tok`, s?.lastCacheAt ? `cache ${fmtDur(now - s.lastCacheAt)} old` : '', window].filter(Boolean).join(' · ')}
                   </Text>
                 </Box>
               )
-            })}
-          </>,
-        ),
-      )
+            }),
+          ]),
+        )
 
-    // Settings: every option and test mode as one-click choices; nothing to type.
-    const isOpen = await read($, settingsOpen)
-    if (isOpen) {
+      parts.push(
+        <Box key="footer" gap={isRich ? 3 : 2} alignItems="center" flexWrap="wrap">
+          <Text dimColor size="footnote">
+            Read {q.refreshedAt ? `${fmtDur(now - q.refreshedAt)} ago` : 'never'} · alerts {t.headsUp}% · main stops {t.mainStop}%
+          </Text>
+        </Box>,
+      )
+    } else {
+      // Settings: every option and test mode as one-click choices; nothing to type.
+      const chips = (prefix: string, values: number[], current: number | null, fmt: (v: number) => string, pick: (v: number) => Promise<string>) => (
+        <Box gap={1} flexWrap="wrap" alignItems="center">
+          {values.map(v => (
+            <Button key={`${prefix}-${v}`} label={fmt(v)} variant={v === current ? 'primary' : 'secondary'} onPress={() => act(() => pick(v))} />
+          ))}
+        </Box>
+      )
       const row = (key: keyof Thresholds, hint: string) => (
-        <Box key={`row-${key}`} flexDirection="column" marginTop={isRich ? 1 : 0}>
-          <Box gap={1} alignItems="center">
+        <Box key={`row-${key}`} flexDirection="column">
+          <Box gap={1} alignItems="center" flexWrap="wrap">
             <Text bold>{THRESHOLD_NAMES[key]}</Text>
             <Text bold color={key === 'headsUp' ? 'warning' : 'error'}>
               {t[key]}%
             </Text>
-            <Text dimColor>{hint}</Text>
+            <Text dimColor size="footnote">
+              {hint}
+            </Text>
           </Box>
           {chips(`t-${key}`, withCurrent(CHOICES[key], t[key]), t[key], v => `${v}%`, v => setThreshold($, key, String(v)))}
         </Box>
       )
+      const defaultKeep = ov.defaultKeep ?? 'off'
+
       parts.push(
-        card(
-          'settings',
-          null,
-          <>
-            <Box justifyContent="space-between" alignItems="center">
-              <Text bold>Settings</Text>
-              <Button key="settings-close" role="dismiss" label="Close" onPress={() => void update($, settingsOpen, () => false)} />
+        card('new-chats', defaultKeep === 'always' ? 'success' : null, [
+          heading('Every chat'),
+          <Text key="nc-hint" dimColor size="footnote">
+            What keep warm a new chat starts with. Always pings each idle chat every 50 minutes until you press Off there.
+          </Text>,
+          <Box key="nc-chips" gap={1} alignItems="center" flexWrap="wrap">
+            <Button key="default-off" label="Off" variant={defaultKeep === 'off' ? 'primary' : 'secondary'} onPress={() => act(() => setDefaultKeep($, 'off'))} />
+            <Button key="default-always" label="Always" variant={defaultKeep === 'always' ? 'primary' : 'secondary'} onPress={() => act(() => setDefaultKeep($, 'always'))} />
+          </Box>,
+        ]),
+      )
+
+      parts.push(
+        card('levels', null, [
+          heading('Levels'),
+          Svg ? (
+            <Box key="scale" flexDirection="column">
+              <Svg source={scaleSvg(t)} alt={`Levels: heads-up ${t.headsUp}%, subagents stop ${t.subagentsStop}%, main stop ${t.mainStop}%, weekly stop ${t.weekStop}%`} />
             </Box>
-            {Svg ? (
-              <Box flexDirection="column" marginTop={1}>
-                <Svg source={scaleSvg(t)} alt={`Levels: heads-up ${t.headsUp}%, subagents stop ${t.subagentsStop}%, main stop ${t.mainStop}%, weekly stop ${t.weekStop}%`} />
-                <Text dimColor>Where each level sits on its limit. Saved for every session.</Text>
-              </Box>
-            ) : (
-              <Text dimColor>Saved for every session.</Text>
-            )}
-            {row('headsUp', 'a toast for any limit')}
-            {row('subagentsStop', 'subagents pause, 5-hour')}
-            {row('mainStop', 'main session pauses, 5-hour')}
-            {row('weekStop', 'everything stops, weekly')}
-            <Box flexDirection="column" marginTop={1}>
-              <Box gap={1} alignItems="center">
-                <Text bold>Test mode</Text>
-                {ov.simulate ? (
-                  <Text bold color="warning">
-                    on: 5-hour {ov.simulate.fiveHour}%, weekly {ov.simulate.week}%
-                  </Text>
-                ) : (
-                  <Text dimColor>made-up readings to watch a level fire</Text>
-                )}
-              </Box>
-              <Box gap={1} flexWrap="wrap" alignItems="center">
-                {SCENARIOS.map(sc => (
-                  <Button
-                    key={`sim-${sc.key}`}
-                    label={sc.label}
-                    variant={ov.simulate && ov.simulate.fiveHour === sc.five && ov.simulate.week === sc.week ? 'primary' : 'secondary'}
-                    onPress={() => act(async () => { const text = await simulate($, `${sc.five} ${sc.week}`); await tick($, opts); return text })}
-                  />
-                ))}
-                {ov.simulate ? <Button key="sim-end" label="End test" onPress={() => act(() => simulateOff($))} /> : null}
-              </Box>
-            </Box>
-            <Box marginTop={1}>
-              <Button key="settings-reset" label="Reset to defaults" onPress={() => act(() => resetSettings($))} />
-            </Box>
-          </>,
-        ),
+          ) : null,
+          row('headsUp', 'a toast for any limit'),
+          row('subagentsStop', 'subagents pause, 5-hour'),
+          row('mainStop', 'main session pauses, 5-hour'),
+          row('weekStop', 'everything stops, weekly'),
+          <Text key="levels-hint" dimColor size="footnote">
+            Saved for every session. Each level is said once per window reset.
+          </Text>,
+        ]),
+      )
+
+      parts.push(
+        card('test', ov.simulate ? 'warning' : null, [
+          heading('Test mode', ov.simulate ? <Text bold color="warning">on</Text> : null),
+          <Text key="test-hint" dimColor size="footnote">
+            Made-up readings, to watch a level fire.
+          </Text>,
+          <Box key="test-chips" gap={1} flexWrap="wrap" alignItems="center">
+            {SCENARIOS.map(sc => (
+              <Button
+                key={`sim-${sc.key}`}
+                label={sc.label}
+                variant={ov.simulate && ov.simulate.fiveHour === sc.five && ov.simulate.week === sc.week ? 'primary' : 'secondary'}
+                onPress={() => act(async () => { const text = await simulate($, `${sc.five} ${sc.week}`); await tick($, opts); return text })}
+              />
+            ))}
+            {ov.simulate ? <Button key="sim-end" label="End test" onPress={() => act(() => simulateOff($))} /> : null}
+          </Box>,
+        ]),
+      )
+
+      parts.push(
+        <Box key="settings-footer" flexDirection="column" gap={gapY}>
+          <Box>
+            <Button key="settings-reset" label="Reset to defaults" onPress={() => act(() => resetSettings($))} />
+          </Box>
+          <Text dimColor size="footnote">
+            Extra usage drops the cache to 5 minutes; a mod cannot see it.
+          </Text>
+        </Box>,
       )
     }
-
-    // Footer: refresh, context, the thresholds, the one thing a mod cannot see.
-    parts.push(
-      <Box key="footer" flexDirection="column">
-        <Box gap={isRich ? 3 : 2} alignItems="center" flexWrap="wrap">
-          <Button key="refresh" label="Refresh" onPress={() => act(async () => { await refresh($); await judge($, opts); return 'Refreshed.' })} />
-          <Button key="settings" label={isOpen ? 'Hide settings' : 'Settings'} onPress={() => void update($, settingsOpen, v => !v)} />
-          {l && l.contextPercent !== null ? stat(`${l.contextPercent}%`, 'context') : null}
-          {stat(q.refreshedAt ? `${fmtDur(now - q.refreshedAt)} ago` : 'never', 'read')}
-        </Box>
-        <Text dimColor>
-          Alerts at {t.headsUp}% · subagents stop {t.subagentsStop}% · main stops {t.mainStop}% · weekly stop {t.weekStop}%
-        </Text>
-        <Text dimColor>Extra usage drops the cache to 5 minutes; a mod cannot see it.</Text>
-        {note ? <Text color={note.startsWith('Failed') || note.startsWith('Use') ? 'error' : 'success'}>{note}</Text> : null}
-      </Box>,
-    )
 
     return <Box flexDirection="column">{parts}</Box>
   })
 
-  // A small band above the prompt, in the cache-countdown style: the cache's time left and what
-  // the next message would re-cache, the live warning from the thresholds, and while work is
-  // paused or kept warm, the ping plan. Settings opens the panel. What sits beneath is kept.
+  // The band above the prompt: the cache's time left, what is cached and the miss rate, the
+  // live warning from the thresholds, and while kept warm or paused, the ping plan. Quota opens
+  // the panel. What sits beneath (another plugin's band) is kept.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
     const below = await next(e)
@@ -1067,17 +1271,23 @@ export const register: Register = (on, options) => {
     const q = await read($, quota)
     const m = await read($, main)
     const p = await read($, pause)
+    const k = await read($, keep)
+    const st: CacheStats = { ...EMPTY_STATS, ...(await read($, stats)) }
     const t = thresholdsOf(opts, await read($, overrides))
     const l = q.limits
-    if (!l && !m.lastCacheAt) return below
+    if (!m.lastCacheAt) return below
 
-    // The cache: time left of its lifetime, and what a cold cache would cost.
+    // The cache: time left of its lifetime, what is cached, and the session's miss rate.
     const ttl = l && windowsOf(l).some(w => w.win.percent >= 100) ? 5 * MINUTE : HOUR
-    const left = m.lastCacheAt ? m.lastCacheAt + ttl - now : null
-    const share = left === null ? 0 : Math.max(0, left / ttl)
-    const tone: Tone = left === null ? 'success' : cacheTone(share)
-    const kTok = (n: number) => (n < 1000 ? `${n}` : `${Math.round(n / 1000)}k`)
-    const recache = m.recache ? kTok(m.recache) : null
+    const left = m.lastCacheAt + ttl - now
+    const isWarm = left > 0
+    const share = Math.max(0, left / ttl)
+    const tone: Tone = cacheTone(share)
+    const recache = fmtTok(m.recache ?? cachedNow(st))
+    const cached = fmtTok(cachedNow(st) || m.recache || 0)
+    const hit = hitRate(st.read, st.written, st.uncached)
+    const miss = hit === null ? null : pct((1 - hit) * 100)
+    const missTone: Tone | undefined = hit === null ? undefined : hitTone(hit) === 'success' ? undefined : hitTone(hit)
 
     // The live warning: the highest level any limit has reached.
     let warning: { text: string; tone: Tone; rank: number } | null = null
@@ -1096,7 +1306,7 @@ export const register: Register = (on, options) => {
       if (w && (!warning || w.rank > warning.rank)) warning = w
     }
 
-    // Paused or kept warm: the plan that keeps the cache alive to the end.
+    // Kept warm or paused: the plan that keeps the cache alive.
     const tgt = await warmTarget($)
     const clockAt = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     const farOff = p.kind === 'quota' && !keepAliveWorth(p.until, now)
@@ -1105,7 +1315,9 @@ export const register: Register = (on, options) => {
       ? null
       : p.kind !== 'none'
         ? `Paused${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
-        : `Warm${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
+        : k.choice === 'always'
+          ? 'Warm ∞'
+          : `Warm${tgt.until ? ` until ${clockAt(tgt.until)}` : ''}`
     const planText = !tgt
       ? null
       : farOff
@@ -1114,38 +1326,19 @@ export const register: Register = (on, options) => {
           ? 'no pings: limit at 100%'
           : plan === null
             ? 'no ping needed'
-            : `${plan.left === null ? 'pinging' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} · next ${fmtDur(Math.max(0, plan.next - now))}`
+            : `${plan.left === null ? 'ping' : plan.left === 1 ? '1 ping' : `${plan.left} pings`} · next ${fmtDur(Math.max(0, plan.next - now))}`
 
     const openPanel = async () => {
-      await update($, settingsOpen, () => true)
+      await update($, settingsOpen, () => false)
       await $.ui.open({ id: PANE, title: 'Quota' })
-    }
-
-    // The band is cache-countdown's own drawing, copied as it is (its ring, its desktop row, its
-    // terminal row with the block bar); only the stats on the right are ours: what to re-cache,
-    // our warning or the ping plan, and Settings.
-    if (left === null) return below
-    const v = {
-      isWarm: left > 0,
-      tone,
-      ttl: ttl === HOUR ? '1h' : '5m',
-      share,
-      ms: Math.max(0, left),
-      left:
-        left >= HOUR
-          ? `${Math.floor(left / HOUR)}h ${Math.floor((left % HOUR) / 60000)}m`
-          : left >= 60 * 1000
-            ? `${Math.ceil(left / 60000)}m`
-            : `${Math.ceil(Math.max(0, left) / 1000)}s`,
-      recache: recache ?? '0',
     }
     const minutes = (ms: number) => (ms >= 60 * 1000 ? `${Math.ceil(ms / 60000)} min` : `${Math.ceil(ms / 1000)} sec`)
 
-    // Ours, after the re-cache stat: the ping plan while paused or kept warm, else the warning; then Settings.
+    // After the cache figures: the ping plan while kept warm or paused, else the warning; then Quota.
     const extras = () => [
       holdText ? (
         <Box key="hold" gap={1} alignItems="center">
-          <Text bold color="warning">
+          <Text bold color={p.kind !== 'none' ? 'warning' : 'success'}>
             {holdText}
           </Text>
           {planText && !isNarrow ? <Text dimColor>{planText}</Text> : null}
@@ -1156,110 +1349,101 @@ export const register: Register = (on, options) => {
           {warning.text}
         </Text>
       ) : null,
-      <Button key="band-settings" label="Settings" onPress={() => void openPanel()} />,
+      <Button key="band-open" label="Quota" dimColor onPress={() => void openPanel()} />,
     ]
 
     let ours: RenderChildren
     if (isRich && Svg) {
-      const stat = (value: string, label: string) => (
+      const stat = (value: string, label: string, color?: Tone) => (
         <Box key={label} gap={1} alignItems="center">
-          <Text bold>{value}</Text>
+          <Text bold tabular color={color}>
+            {value}
+          </Text>
           <Text dimColor>{label}</Text>
         </Box>
       )
-
-      const alt = v.isWarm
-        ? `Prompt cache warm, ${minutes(v.ms)} left`
-        : `Prompt cache cold, next message re-caches ${v.recache} tokens`
-
+      const alt = isWarm ? `Prompt cache warm, ${minutes(left)} left` : `Prompt cache cold, next message re-caches ${recache} tokens`
       ours = (
         <Box borderStyle="round" borderDimColor paddingX={1} alignItems="center" justifyContent="space-between" gap={3}>
           <Box gap={1} alignItems="center" flexShrink={0}>
-            <Svg source={ringSvg(v.isWarm ? v.share : 0, v.tone)} alt={alt} width={18} height={18} />
+            <Svg source={ringSvg(isWarm ? share : 0, tone)} alt={alt} width={18} height={18} />
             <Text bold>Prompt cache</Text>
-            {v.isWarm ? (
+            {isWarm ? (
               <Box gap={1} alignItems="center">
-                <Text color={v.tone} bold>
-                  {minutes(v.ms)} left
+                <Text color={tone} bold tabular>
+                  {minutes(left)} left
                 </Text>
-                {holdText ? null : <Text dimColor>of {v.ttl === '1h' ? '60 min' : '5 min'}</Text>}
+                {holdText || isNarrow ? null : <Text dimColor>of {ttl === HOUR ? '60 min' : '5 min'}</Text>}
               </Box>
             ) : (
-              <Text color={v.tone} bold>
+              <Text color={tone} bold>
                 Expired
               </Text>
             )}
           </Box>
-          {v.isWarm ? (
-            <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap" justifyContent="flex-end">
-              {isNarrow || holdText ? null : stat(v.recache, 'to re-cache')}
-              {extras()}
-            </Box>
-          ) : (
-            <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap">
-              <Box gap={1} alignItems="center">
-                <Text dimColor>Next message re-caches</Text>
-                <Text bold>{v.recache} tokens</Text>
-              </Box>
-              {extras()}
-            </Box>
-          )}
+          <Box gap={3} alignItems="center" flexShrink={1} flexWrap="wrap" justifyContent="flex-end">
+            {isWarm ? (isNarrow ? null : stat(cached, 'cached')) : stat(`${recache} tokens`, 'to re-cache', 'error')}
+            {miss === null ? null : stat(miss, 'miss', missTone)}
+            {extras()}
+          </Box>
         </Box>
       )
     } else {
-      const stat = (label: string, value: string) => (
+      const stat = (label: string, value: string, color?: Tone) => (
         <Box key={label} gap={1}>
           <Text dimColor>{label}</Text>
-          <Text bold>{value}</Text>
+          <Text bold color={color}>
+            {value}
+          </Text>
         </Box>
       )
-
       const status = (
         <Box gap={1} flexShrink={0}>
-          <Text color={v.tone} bold>
-            {v.isWarm ? '●' : '○'} cache
+          <Text color={tone} bold>
+            {isWarm ? '●' : '○'} cache
           </Text>
-          <Text color={v.tone}>{v.isWarm ? 'warm' : 'cold'}</Text>
-          {v.isWarm ? <Text dimColor>{v.ttl} ttl</Text> : null}
+          <Text color={tone}>{isWarm ? 'warm' : 'cold'}</Text>
+          {isWarm ? <Text dimColor>{ttl === HOUR ? '1h' : '5m'} ttl</Text> : null}
         </Box>
       )
-
-      if (!v.isWarm) {
+      if (!isWarm) {
         ours = (
-          <Box borderStyle="round" borderColor={v.tone} paddingX={1} gap={2} flexWrap="wrap">
+          <Box borderStyle="round" borderColor={tone} paddingX={1} gap={2} flexWrap="wrap">
             {status}
             <Box gap={1}>
               <Text dimColor>next message re-caches</Text>
-              <Text bold color={v.tone}>
-                {v.recache} tokens
+              <Text bold color={tone}>
+                {recache} tokens
               </Text>
             </Box>
+            {miss === null ? null : stat('miss', miss, missTone)}
             {extras()}
           </Box>
         )
       } else {
-        // The bar takes what the row leaves: status and time on the left, the
-        // stats column on the right when there is room for it.
-        const cells = Math.max(6, Math.min(28, e.props.bodyColumns - (isNarrow ? 40 : 94)))
-        const filled = Math.max(1, Math.round(v.share * cells))
-
+        // The bar takes what the row leaves: status and time on the left, the stats on the right.
+        const cells = Math.max(6, Math.min(24, e.props.bodyColumns - (isNarrow ? 44 : 100)))
+        const filled = Math.max(1, Math.round(share * cells))
+        const leftText =
+          left >= HOUR ? `${Math.floor(left / HOUR)}h ${Math.floor((left % HOUR) / 60000)}m` : left >= 60 * 1000 ? `${Math.ceil(left / 60000)}m` : `${Math.ceil(left / 1000)}s`
         ours = (
-          <Box borderStyle="round" borderColor={v.tone} borderDimColor={v.tone === 'success'} paddingX={1} justifyContent="space-between" gap={2}>
+          <Box borderStyle="round" borderColor={tone} borderDimColor={tone === 'success'} paddingX={1} justifyContent="space-between" gap={2}>
             <Box gap={2} flexShrink={0}>
               {status}
               <Box gap={1}>
                 <Text>
-                  <Text color={v.tone}>{'█'.repeat(filled)}</Text>
+                  <Text color={tone}>{'█'.repeat(filled)}</Text>
                   <Text dimColor>{'░'.repeat(cells - filled)}</Text>
                 </Text>
-                <Text bold color={v.tone}>
-                  {v.left}
+                <Text bold color={tone}>
+                  {leftText}
                 </Text>
                 <Text dimColor>left</Text>
               </Box>
             </Box>
             <Box gap={2} flexShrink={1} flexWrap="wrap">
-              {isNarrow || holdText ? null : stat('re-cache', v.recache)}
+              {isNarrow ? null : stat('cached', cached)}
+              {miss === null ? null : stat('miss', miss, missTone)}
               {extras()}
             </Box>
           </Box>
