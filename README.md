@@ -23,12 +23,12 @@ The pane follows the cache-countdown mod: rounded cards, a ring and a bar in gre
 
 A one-line band above the prompt box, in the cache-countdown style:
 - the prompt cache: a ring, time left of its 60 minutes (or Expired, with how many tokens the next message would re-cache);
-- the tokens cached now and the session's cache **miss rate** (amber under 80% hits, red under 50%);
+- the tokens cached now, how many tokens a **re-cache** would write if the cache lapsed (the whole context, shown in every state), and the session's cache **miss rate** (amber under 80% hits, red under 50%);
 - the live warning from your thresholds (heads-up, subagents stop, stop), in amber or red;
 - while work is paused or kept warm: until when and the ping plan (`Warm ∞ · ping · next 12m`, `Paused until 23:53 · 3 pings · next 12m`);
 - **Quota**, which opens the panel.
 
-It stacks with any other band, such as cache-countdown's; turn that mod off if one cache line is enough.
+It stacks with any other band; this one replaces the cache-countdown mod's, so turn that mod off.
 
 ## Controls in the pane
 
@@ -57,9 +57,11 @@ One system, one rule. Pick how long to keep the prompt cache warm (1h, 2h, 4h, u
 
 A ping is the one word `ping`; the model answers in a word, so a ping costs a cache read of the conversation and a few output tokens.
 
+**A cold cache is never rewarmed.** Keep warm only keeps a warm cache warm. Once the cache has lapsed (a ping that did not land, a machine asleep) or before any reply has written it, no ping goes out: rewarming would pay for the whole context again for a chat you may not come back to. Your own next message warms it, and keep warm carries on from there. The panel and the band say when it is waiting on you (`cold: not rewarmed until you send`).
+
 **Pause work until then** also stops Claude and its subagents, and tells them to continue at the end; **Continue now** ends it early. When a limit reaches its stop level, the mod does both by itself: work paused, kept warm until the reset. Paused subagents are kept warm on the same rule.
 
-It does not ping while a turn runs (the turn keeps the cache warm), at 100% of a limit (every request is refused), or for a limit's pause more than 12 hours from its reset (a weekly window): there the pings would cost more than rebuilding the cache once. The panel says which. A ping that does not refresh the cache is tried again 5 minutes later, until the cache is an hour old: then it is gone, and pinging waits for your next message. Each ping spends a little quota and shows as a row in the transcript.
+It does not ping while a turn runs (the turn keeps the cache warm), at 100% of a limit (every request is refused), or for a limit's pause more than 12 hours from its reset (a weekly window): there the pings would cost more than rebuilding the cache once. The panel says which. A ping that does not refresh the cache is tried again 5 minutes later while the cache is still warm; past its hour it is cold, and the rule above applies. Each ping spends a little quota and shows as a row in the transcript.
 
 A quota pause also ends when a fresh reading shows the window back under the level that paused it.
 
